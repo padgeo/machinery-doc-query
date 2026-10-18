@@ -96,7 +96,7 @@ pub async fn run<P: EmbeddingProvider>(
         .canonicalize()
         .with_context(|| format!("cannot read input directory {}", input_dir.display()))?;
     let all_pdfs = collect_pdfs(&input_dir).context("PDF collection failed")?;
-    if all_pdfs.len() == 0 {
+    if all_pdfs.is_empty() {
         return Ok(IngestSummary::new());
     }
 
@@ -137,13 +137,13 @@ fn collect_pdfs(input_dir: &PathBuf) -> Result<Vec<PathBuf>, IngestError> {
     match glob(&format!("{}/**/*.pdf", input_dir.display())) {
         Ok(files) => {
             let pdfs: Vec<PathBuf> = files.into_iter().filter_map(|f| f.ok()).collect();
-            if pdfs.len() == 0 {
+            if pdfs.is_empty() {
                 return Err(IngestError::CollectionError(format!(
                     "No files found in dir {:?}",
                     input_dir
                 )));
             }
-            return Ok(pdfs);
+            Ok(pdfs)
         }
 
         Err(e) => Err(IngestError::CollectionError(e.to_string())),
@@ -204,8 +204,7 @@ async fn extract_pdfs(pdfs: Vec<PathBuf>) -> (Vec<(PathBuf, Vec<String>)>, Inges
 fn chunk_all_pages(all_pages: Vec<(PathBuf, Vec<String>)>, options: &ChunkOptions) -> Vec<Chunk> {
     all_pages
         .iter()
-        .map(|(source_file, pages)| chunk_pages(source_file, &pages, options))
-        .flatten()
+        .flat_map(|(source_file, pages)| chunk_pages(source_file, pages, options))
         .collect()
 }
 

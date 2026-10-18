@@ -33,7 +33,7 @@ impl QdrantStore {
         }
         let qdrant_client = builder
             .build()
-            .map_err(|e| QdrantStoreError::QdrantProcessError(e))?;
+            .map_err(QdrantStoreError::QdrantProcessError)?;
         Ok(Self {
             client: qdrant_client,
         })
@@ -87,9 +87,7 @@ impl QdrantStore {
                         Some(vec_config) => match vec_config.config {
                             None => None,
                             Some(Config::Params(vec_params)) => Some(vec_params.size),
-                            Some(Config::ParamsMap(map)) => {
-                                map.map.values().next().and_then(|v| Some(v.size))
-                            }
+                            Some(Config::ParamsMap(map)) => map.map.values().next().map(|v| v.size),
                         },
                     },
                 },
