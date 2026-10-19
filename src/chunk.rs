@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use qdrant_client::qdrant::ScoredPoint;
 
@@ -34,10 +34,10 @@ impl RetrievedChunk {
     pub fn from_scored_point(scored_point: ScoredPoint) -> Self {
         let payload = scored_point.payload;
 
-        let source_file: PathBuf = match payload.get("source_file") {
-            None => PathBuf::new(),
+        let source_file = match payload.get("source_file") {
+            None => PathBuf::from(""),
             Some(payload_value) => match payload_value.as_str() {
-                None => PathBuf::new(),
+                None => PathBuf::from(""),
                 Some(payload_str_value) => PathBuf::from(payload_str_value),
             },
         };
@@ -46,10 +46,7 @@ impl RetrievedChunk {
             None => 0,
             Some(payload_value) => match payload_value.as_integer() {
                 None => 0,
-                Some(payload_int_value) => match usize::try_from(payload_int_value) {
-                    Err(_) => 0,
-                    Ok(payload_usize_value) => payload_usize_value,
-                },
+                Some(payload_int_value) => usize::try_from(payload_int_value).unwrap_or_default(),
             },
         };
 
@@ -57,10 +54,7 @@ impl RetrievedChunk {
             None => 0,
             Some(payload_value) => match payload_value.as_integer() {
                 None => 0,
-                Some(payload_int_value) => match usize::try_from(payload_int_value) {
-                    Err(_) => 0,
-                    Ok(payload_usize_value) => payload_usize_value,
-                },
+                Some(payload_int_value) => usize::try_from(payload_int_value).unwrap_or_default(),
             },
         };
 
@@ -84,7 +78,7 @@ impl RetrievedChunk {
     }
 }
 
-pub fn chunk_pages(source_file: &PathBuf, pages: &[String], options: &ChunkOptions) -> Vec<Chunk> {
+pub fn chunk_pages(source_file: &Path, pages: &[String], options: &ChunkOptions) -> Vec<Chunk> {
     let mut result: Vec<Chunk> = Vec::new();
     let mut end = 0;
     let mut cursor = 0;
@@ -111,7 +105,7 @@ pub fn chunk_pages(source_file: &PathBuf, pages: &[String], options: &ChunkOptio
             }
 
             let new_chunk = Chunk {
-                source_file: source_file.clone(),
+                source_file: PathBuf::from(source_file),
                 chunk_index: chunk_idx,
                 page_number: page_n,
                 text: String::from(&p[cursor..cut_point]),

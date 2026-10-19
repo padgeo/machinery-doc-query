@@ -129,12 +129,13 @@ async fn process_ingest(
     )
     .context("QdrantStore error occurred")?;
     let collection = app_config.qdrant_collection;
-    let dimensions =
-        usize::try_from(app_config.embedding_dimensions).context("Conversion failure")?;
+    // clippy note: converting `u16` to `usize` cannot fail
+    let dimensions = usize::from(app_config.embedding_dimensions);
     let provider = HashProvider { dimensions };
 
-    let chunk_size = usize::try_from(chunk_size).context("Conversion failure")?;
-    let overlap = usize::try_from(chunk_overlap).context("Conversion failure")?;
+    // clippy note: converting `u16` to `usize` cannot fail
+    let chunk_size = usize::from(chunk_size);
+    let overlap = usize::from(chunk_overlap);
     let chunk_options = ChunkOptions {
         chunk_size,
         overlap,
