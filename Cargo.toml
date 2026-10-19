@@ -1,0 +1,33 @@
+[package]
+name = "machinery-doc-query"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+# PRD-mandated core crates
+clap = { version = "4.6.6", features = ["derive", "env", "cargo"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+serde = { version = "1.0.229", features = ["derive"] }
+pdf-extract = "0.12.0"
+async-openai = { version = "0.41.3", features = ["chat-completion", "embedding"] }
+qdrant-client = { version = "1.19.0", features = ["uuid"] }
+
+# Supporting crates
+serde_json = "1.0.151"
+uuid = { version = "1.26.0", features = ["v5", "serde"] }
+dotenvy = "0.15.7"
+url = "2.5.8"
+anyhow = "1.0.104"
+thiserror = "2.0.20"
+backoff = { version = "0.4.0", features = ["tokio"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+glob = "0.3.4"
+
+[dev-dependencies]
+wiremock = "0.6.5"
+testcontainers = "0.28.0"
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+printpdf = "0.12.7"
