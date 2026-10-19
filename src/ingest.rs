@@ -1,5 +1,5 @@
 use std::fmt::Debug;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use glob::glob;
@@ -82,7 +82,7 @@ pub enum IngestError {
 }
 
 pub async fn run<P: EmbeddingProvider>(
-    input_dir: &PathBuf,
+    input_dir: &Path,
     store: &QdrantStore,
     collection: &str,
     provider: &P,
