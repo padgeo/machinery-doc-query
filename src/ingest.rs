@@ -211,52 +211,31 @@ fn chunk_all_pages(all_pages: Vec<(PathBuf, Vec<String>)>, options: &ChunkOption
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::hash_provider::HashProvider;
+    use crate::{
+        ai::hash_provider::HashProvider,
+        pdf::gen_fixture_pdfs::{BOILER, NO_TEXT, PUMP, TestPdfs},
+    };
+    use rstest::{fixture, rstest};
     use std::collections::BTreeSet;
 
-    fn fixtures_dir() -> PathBuf {
-        PathBuf::from("tests/fixtures/pdfs")
-            .canonicalize()
-            .expect("fixtures directory exists")
+    #[fixture]
+    fn generated_test_pdfs() -> TestPdfs {
+        TestPdfs::generate()
     }
 
-    // Removes its directory on drop, so a failing assertion doesn't leave files behind.
-    struct TempDir(PathBuf);
+    #[rstest]
+    fn collect_pdfs_finds_every_generated_pdf(generated_test_pdfs: TestPdfs) {
+        let pdfs = collect_pdfs(&generated_test_pdfs.dir()).expect("the directory contains pdfs");
 
-    impl TempDir {
-        fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("mdq-{label}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).unwrap();
-            TempDir(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn file_names(paths: &[PathBuf]) -> BTreeSet<String> {
-        paths
+        let found: BTreeSet<String> = pdfs
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect()
-    }
-
-    #[test]
-    fn collect_pdfs_finds_every_fixture_pdf() {
-        let pdfs = collect_pdfs(&fixtures_dir()).expect("fixtures contain pdfs");
-        let expected: BTreeSet<String> = [
-            "boiler_x200_manual.pdf",
-            "no_text_layer.pdf",
-            "pump_y50_manual.pdf",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        assert_eq!(file_names(&pdfs), expected);
+            .collect();
+        let expected: BTreeSet<String> = [BOILER, PUMP, NO_TEXT]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(found, expected);
     }
 
     #[test]
@@ -273,8 +252,9 @@ mod tests {
     // Whatever collect_pdfs returns must be something extract_pdfs can actually read.
     // The fixture without any text is read fine but skipped, not counted as extracted.
     #[tokio::test]
-    async fn every_collected_pdf_can_be_extracted() {
-        let pdfs = collect_pdfs(&fixtures_dir()).unwrap();
+    #[rstest]
+    async fn every_collected_pdf_can_be_extracted(generated_test_pdfs: TestPdfs) {
+        let pdfs = collect_pdfs(&generated_test_pdfs.dir()).unwrap();
         let (pages, summary) = extract_pdfs(pdfs).await;
         assert!(
             summary.failed.is_empty(),
@@ -286,8 +266,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pdf_without_text_is_skipped_not_succeeded() {
-        let no_text = fixtures_dir().join("no_text_layer.pdf");
+    #[rstest]
+    async fn a_pdf_without_text_is_skipped_not_succeeded(generated_test_pdfs: TestPdfs) {
+        let no_text = generated_test_pdfs.path(NO_TEXT);
 
         let (pages, summary) = extract_pdfs(vec![no_text.clone()]).await;
 
@@ -300,13 +281,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_pdfs_are_reported_as_failed_and_the_rest_continue() {
-        let dir = TempDir::new("corrupt");
-        let zero_bytes = dir.0.join("zero_bytes.pdf");
-        let not_a_pdf = dir.0.join("not_a_pdf.pdf");
+    #[rstest]
+    async fn corrupt_pdfs_are_reported_as_failed_and_the_rest_continue(
+        generated_test_pdfs: TestPdfs,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let zero_bytes = dir.path().join("zero_bytes.pdf");
+        let not_a_pdf = dir.path().join("not_a_pdf.pdf");
         std::fs::write(&zero_bytes, b"").unwrap();
         std::fs::write(&not_a_pdf, b"this is not a pdf").unwrap();
-        let good = fixtures_dir().join("boiler_x200_manual.pdf");
+        let good = generated_test_pdfs.path(BOILER);
 
         let (pages, summary) =
             extract_pdfs(vec![zero_bytes.clone(), good.clone(), not_a_pdf.clone()]).await;
@@ -318,9 +302,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_unreadable_pdf_does_not_stop_the_others() {
-        let good = fixtures_dir().join("boiler_x200_manual.pdf");
-        let missing = fixtures_dir().join("does_not_exist.pdf");
+    #[rstest]
+    async fn one_unreadable_pdf_does_not_stop_the_others(generated_test_pdfs: TestPdfs) {
+        let good = generated_test_pdfs.path(BOILER);
+        let missing = generated_test_pdfs.dir().join("does_not_exist.pdf");
 
         let (pages, summary) = extract_pdfs(vec![good.clone(), missing.clone()]).await;
 
@@ -391,18 +376,19 @@ mod tests {
 
     // Nothing listens on port 1, so any attempt to reach Qdrant would make the run fail.
     #[tokio::test]
-    async fn run_never_touches_qdrant_when_every_file_is_skipped() {
-        let dir = TempDir::new("only-scans");
+    #[rstest]
+    async fn run_never_touches_qdrant_when_every_file_is_skipped(generated_test_pdfs: TestPdfs) {
+        let dir = tempfile::tempdir().unwrap();
         std::fs::copy(
-            fixtures_dir().join("no_text_layer.pdf"),
-            dir.0.join("scan.pdf"),
+            generated_test_pdfs.path(NO_TEXT),
+            dir.path().join("scan.pdf"),
         )
         .unwrap();
         let store = QdrantStore::connect("http://127.0.0.1:1", None).unwrap();
         let provider = HashProvider { dimensions: 8 };
 
         let summary = run(
-            &dir.0,
+            dir.path(),
             &store,
             "unused",
             &provider,

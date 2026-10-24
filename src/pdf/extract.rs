@@ -15,22 +15,28 @@ pub enum PdfExtractionError {
 
 #[cfg(test)]
 mod tests {
+    use crate::pdf::gen_fixture_pdfs::{BOILER, NO_TEXT, PUMP, TestPdfs};
+    use rstest::{fixture, rstest};
+
     use super::*;
 
-    const FIXTURES: &str = "tests/fixtures/pdfs";
+    #[fixture]
+    fn generated_test_pdfs() -> TestPdfs {
+        TestPdfs::generate()
+    }
 
-    #[test]
-    fn extracts_known_text_and_page_count_from_boiler_manual() {
-        let pages = extract_pages(&PathBuf::from(format!("{FIXTURES}/boiler_x200_manual.pdf")))
+    #[rstest]
+    fn extracts_known_text_and_page_count_from_boiler_manual(generated_test_pdfs: TestPdfs) {
+        let pages = extract_pages(&generated_test_pdfs.path(BOILER))
             .expect("should extract text from a valid pdf");
         assert_eq!(pages.len(), 2);
         assert!(pages[0].contains("WARNING: Allow unit to cool for 30 minutes before servicing."));
         assert!(pages[1].contains("CAUTION: Do not use abrasive cleaners on the sensor housing."));
     }
 
-    #[test]
-    fn extracts_all_pages_from_pump_manual() {
-        let pages = extract_pages(&PathBuf::from(format!("{FIXTURES}/pump_y50_manual.pdf")))
+    #[rstest]
+    fn extracts_all_pages_from_pump_manual(generated_test_pdfs: TestPdfs) {
+        let pages = extract_pages(&generated_test_pdfs.path(PUMP))
             .expect("should extract text from a valid pdf");
         assert_eq!(pages.len(), 1);
         assert!(pages[0].contains("Turn off water source"));
@@ -38,17 +44,20 @@ mod tests {
         assert!(pages[0].contains("Install pipe"));
     }
 
-    #[test]
-    fn no_text_layer_page_extracts_as_empty_not_an_error() {
-        let pages = extract_pages(&PathBuf::from(format!("{FIXTURES}/no_text_layer.pdf")))
+    #[rstest]
+    fn no_text_layer_page_extracts_as_empty_not_an_error(generated_test_pdfs: TestPdfs) {
+        let pages = extract_pages(&generated_test_pdfs.path(NO_TEXT))
             .expect("a page with no text layer should still succeed, just with empty text");
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].trim(), "");
     }
 
-    #[test]
-    fn missing_file_returns_io_error() {
-        let result = extract_pages(&PathBuf::from(format!("{FIXTURES}/does_not_exist.pdf")));
+    #[rstest]
+    fn missing_file_returns_io_error(generated_test_pdfs: TestPdfs) {
+        let result = extract_pages(&PathBuf::from(format!(
+            "{:?}/does_not_exist.pdf",
+            generated_test_pdfs.dir()
+        )));
         assert!(matches!(result, Err(PdfExtractionError::IoError(_))));
     }
 }
