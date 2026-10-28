@@ -1,6 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use qdrant_client::qdrant::ScoredPoint;
+use qdrant_client::qdrant::{ScoredPoint, Value};
+
+pub const SOURCE_KEY: &str = "source_file";
+pub const PAGE_KEY: &str = "page_number";
+pub const CHUNK_KEY: &str = "chunk_index";
+pub const TEXT_KEY: &str = "text";
 
 pub struct Chunk {
     pub source_file: PathBuf, // relative
@@ -30,41 +35,29 @@ pub struct RetrievedChunk {
     score: f32,
 }
 
-impl RetrievedChunk {
-    pub fn from_scored_point(scored_point: ScoredPoint) -> Self {
+impl From<ScoredPoint> for RetrievedChunk {
+    fn from(scored_point: ScoredPoint) -> Self {
         let payload = scored_point.payload;
 
-        let source_file = match payload.get("source_file") {
-            None => PathBuf::from(""),
-            Some(payload_value) => match payload_value.as_str() {
-                None => PathBuf::from(""),
-                Some(payload_str_value) => PathBuf::from(payload_str_value),
-            },
-        };
+        let source_file = payload
+            .get(SOURCE_KEY)
+            .and_then(Value::as_str)
+            .map_or_default(PathBuf::from);
 
-        let page_number = match payload.get("page_number") {
-            None => 0,
-            Some(payload_value) => match payload_value.as_integer() {
-                None => 0,
-                Some(payload_int_value) => usize::try_from(payload_int_value).unwrap_or_default(),
-            },
-        };
+        let page_number = payload
+            .get(PAGE_KEY)
+            .and_then(Value::as_integer)
+            .map_or_default(|i| usize::try_from(i).unwrap());
 
-        let chunk_index = match payload.get("chunk_index") {
-            None => 0,
-            Some(payload_value) => match payload_value.as_integer() {
-                None => 0,
-                Some(payload_int_value) => usize::try_from(payload_int_value).unwrap_or_default(),
-            },
-        };
+        let chunk_index = payload
+            .get(CHUNK_KEY)
+            .and_then(Value::as_integer)
+            .map_or_default(|i| usize::try_from(i).unwrap());
 
-        let text = match payload.get("text") {
-            None => String::from(""),
-            Some(payload_value) => match payload_value.as_str() {
-                None => String::from(""),
-                Some(payload_str_value) => String::from(payload_str_value),
-            },
-        };
+        let text = payload
+            .get(TEXT_KEY)
+            .and_then(Value::as_str)
+            .map_or_default(|s| s.to_owned());
 
         RetrievedChunk {
             chunk: Chunk {
@@ -78,7 +71,7 @@ impl RetrievedChunk {
     }
 }
 
-pub fn chunk_pages(source_file: &Path, pages: &[String], options: &ChunkOptions) -> Vec<Chunk> {
+pub fn chunk_pages(source_file: &Path, pages: &[&String], options: &ChunkOptions) -> Vec<Chunk> {
     let mut result: Vec<Chunk> = Vec::new();
     let mut end = 0;
     let mut cursor = 0;
@@ -249,7 +242,8 @@ mod tests {
             chunk_size: 1500,
             overlap: 200,
         };
-        let pages = vec![String::new()];
+        let page1 = &String::new();
+        let pages = vec![page1];
         let chunks = chunk_pages(&PathBuf::from("blank.pdf"), &pages, &options);
         assert!(chunks.is_empty());
     }
@@ -260,11 +254,10 @@ mod tests {
             chunk_size: 50,
             overlap: 15,
         };
-        let pages = vec![
-            "Page one text".to_string(),
-            "  \n\n \t ".to_string(),
-            "Page three text".to_string(),
-        ];
+        let page1 = &String::from("Page one text");
+        let page2 = &String::from("  \n\n \t ");
+        let page3 = &String::from("Page three text");
+        let pages = vec![page1, page2, page3];
 
         let chunks = chunk_pages(&PathBuf::from("gaps.pdf"), &pages, &options);
 
@@ -281,7 +274,8 @@ mod tests {
             chunk_size: 50,
             overlap: 15,
         };
-        let pages = vec!["Turn off the main breaker before servicing.".to_string()];
+        let page1 = &String::from("Turn off the main breaker before servicing.");
+        let pages = vec![page1];
         let chunks = chunk_pages(&PathBuf::from("short.pdf"), &pages, &options);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "Turn off the main breaker before servicing");
@@ -296,10 +290,10 @@ mod tests {
             chunk_size: 55,
             overlap: 15,
         };
-        let pages = vec![
-            "Step 4: Open the drain valve. WARNING: Scalding water may discharge. Step 5: Replace the gasket."
-                .to_string(),
-        ];
+        let page1 = &String::from(
+            "Step 4: Open the drain valve. WARNING: Scalding water may discharge. Step 5: Replace the gasket.",
+        );
+        let pages = vec![page1];
         let chunks = chunk_pages(&PathBuf::from("boiler.pdf"), &pages, &options);
         assert!(
             chunks
@@ -317,7 +311,8 @@ mod tests {
             chunk_size: 50,
             overlap: 15,
         };
-        let pages = vec!["a".repeat(200)];
+        let page1 = &"a".repeat(200);
+        let pages = vec![page1];
         let chunks = chunk_pages(&PathBuf::from("nopunct.pdf"), &pages, &options);
         assert!(chunks.len() > 1);
         let total_chars: usize = chunks.iter().map(|c| c.text.len()).sum();
@@ -334,10 +329,9 @@ mod tests {
             chunk_size: 50,
             overlap: 15,
         };
-        let pages = vec![
-            "Page one text ends here without punctuation".to_string(),
-            "Page two text also ends here".to_string(),
-        ];
+        let page1 = &String::from("Page one text ends here without punctuation");
+        let page2 = &String::from("Page two text also ends here");
+        let pages = vec![page1, page2];
         let chunks = chunk_pages(&PathBuf::from("multi.pdf"), &pages, &options);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].page_number, 1);
@@ -353,10 +347,10 @@ mod tests {
             chunk_size: 50,
             overlap: 15,
         };
-        let pages = vec![
-            "Calibrate the sensor to read 30\u{b0}C before running the test. Record all values in the logbook for review by the shift lead."
-                .to_string(),
-        ];
+        let page1 = &String::from(
+            "Calibrate the sensor to read 30\u{b0}C before running the test. Record all values in the logbook for review by the shift lead.",
+        );
+        let pages = vec![page1];
         let chunks = chunk_pages(&PathBuf::from("multibyte.pdf"), &pages, &options);
         assert!(!chunks.is_empty());
         assert!(chunks.iter().any(|c| c.text.contains('\u{b0}')));
