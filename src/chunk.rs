@@ -71,7 +71,7 @@ impl From<ScoredPoint> for RetrievedChunk {
     }
 }
 
-pub fn chunk_pages(source_file: &Path, pages: &[&String], options: &ChunkOptions) -> Vec<Chunk> {
+pub fn chunk_pages(source_file: &Path, pages: &[&str], options: &ChunkOptions) -> Vec<Chunk> {
     let mut result: Vec<Chunk> = Vec::new();
     let mut end = 0;
     let mut cursor = 0;
@@ -242,7 +242,7 @@ mod tests {
             chunk_size: 1500,
             overlap: 200,
         };
-        let page1 = &String::new();
+        let page1 = "";
         let pages = vec![page1];
         let chunks = chunk_pages(&PathBuf::from("blank.pdf"), &pages, &options);
         assert!(chunks.is_empty());
@@ -254,9 +254,9 @@ mod tests {
             chunk_size: 50,
             overlap: 15,
         };
-        let page1 = &String::from("Page one text");
-        let page2 = &String::from("  \n\n \t ");
-        let page3 = &String::from("Page three text");
+        let page1 = "Page one text";
+        let page2 = "  \n\n \t ";
+        let page3 = "Page three text";
         let pages = vec![page1, page2, page3];
 
         let chunks = chunk_pages(&PathBuf::from("gaps.pdf"), &pages, &options);
@@ -274,7 +274,7 @@ mod tests {
             chunk_size: 50,
             overlap: 15,
         };
-        let page1 = &String::from("Turn off the main breaker before servicing.");
+        let page1 = "Turn off the main breaker before servicing.";
         let pages = vec![page1];
         let chunks = chunk_pages(&PathBuf::from("short.pdf"), &pages, &options);
         assert_eq!(chunks.len(), 1);
@@ -290,9 +290,7 @@ mod tests {
             chunk_size: 55,
             overlap: 15,
         };
-        let page1 = &String::from(
-            "Step 4: Open the drain valve. WARNING: Scalding water may discharge. Step 5: Replace the gasket.",
-        );
+        let page1 = "Step 4: Open the drain valve. WARNING: Scalding water may discharge. Step 5: Replace the gasket.";
         let pages = vec![page1];
         let chunks = chunk_pages(&PathBuf::from("boiler.pdf"), &pages, &options);
         assert!(
@@ -311,7 +309,7 @@ mod tests {
             chunk_size: 50,
             overlap: 15,
         };
-        let page1 = &"a".repeat(200);
+        let page1: &str = &"a".repeat(200);
         let pages = vec![page1];
         let chunks = chunk_pages(&PathBuf::from("nopunct.pdf"), &pages, &options);
         assert!(chunks.len() > 1);
@@ -329,8 +327,8 @@ mod tests {
             chunk_size: 50,
             overlap: 15,
         };
-        let page1 = &String::from("Page one text ends here without punctuation");
-        let page2 = &String::from("Page two text also ends here");
+        let page1 = "Page one text ends here without punctuation";
+        let page2 = "Page two text also ends here";
         let pages = vec![page1, page2];
         let chunks = chunk_pages(&PathBuf::from("multi.pdf"), &pages, &options);
         assert_eq!(chunks.len(), 2);
@@ -347,9 +345,7 @@ mod tests {
             chunk_size: 50,
             overlap: 15,
         };
-        let page1 = &String::from(
-            "Calibrate the sensor to read 30\u{b0}C before running the test. Record all values in the logbook for review by the shift lead.",
-        );
+        let page1 = "Calibrate the sensor to read 30\u{b0}C before running the test. Record all values in the logbook for review by the shift lead.";
         let pages = vec![page1];
         let chunks = chunk_pages(&PathBuf::from("multibyte.pdf"), &pages, &options);
         assert!(!chunks.is_empty());
