@@ -204,7 +204,10 @@ async fn extract_pdfs(pdfs: Vec<PathBuf>) -> (Vec<(PathBuf, Vec<String>)>, Inges
 fn chunk_all_pages(all_pages: Vec<(PathBuf, Vec<String>)>, options: &ChunkOptions) -> Vec<Chunk> {
     all_pages
         .iter()
-        .flat_map(|(source_file, pages)| chunk_pages(source_file, pages, options))
+        .flat_map(|(source_file, pages)| {
+            let pages_ref: Vec<&str> = pages.iter().map(String::as_str).collect();
+            chunk_pages(source_file, &pages_ref, options)
+        })
         .collect()
 }
 

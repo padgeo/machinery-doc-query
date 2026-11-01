@@ -172,7 +172,7 @@ impl QdrantStore {
         Ok(response
             .result
             .into_iter()
-            .map(RetrievedChunk::from_scored_point)
+            .map(RetrievedChunk::from)
             .collect())
     }
 }
