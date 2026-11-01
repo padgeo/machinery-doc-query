@@ -93,13 +93,13 @@ impl QdrantStore {
                 },
             },
         };
-        if let Some(actual) = info_vector_size {
-            if actual != vector_size {
-                return Err(QdrantStoreError::VectorSizeMismatch {
-                    expected: vector_size,
-                    actual,
-                });
-            }
+        if let Some(actual) = info_vector_size
+            && actual != vector_size
+        {
+            return Err(QdrantStoreError::VectorSizeMismatch {
+                expected: vector_size,
+                actual,
+            });
         }
         Ok(())
     }
