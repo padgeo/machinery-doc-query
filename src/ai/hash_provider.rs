@@ -8,12 +8,15 @@ pub struct HashProvider {
 
 impl HashProvider {
     fn embed_one(text: &str, dimensions: usize) -> Vec<f32> {
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
         let mut vector: Vec<f32> = (0..dimensions)
             .map(|i| {
-                let mut hasher = DefaultHasher::new();
-                text.hash(&mut hasher);
-                i.hash(&mut hasher);
-                let bits = hasher.finish();
+                // Hasher is cloned to retain test results.
+                // This provider is just for testing anyways.
+                let mut cloned_hasher = hasher.clone();
+                i.hash(&mut cloned_hasher);
+                let bits = cloned_hasher.finish();
                 (bits as f64 / u64::MAX as f64) as f32 * 2.0 - 1.0 // -> roughly [-1.0, 1.0]
             })
             .collect();

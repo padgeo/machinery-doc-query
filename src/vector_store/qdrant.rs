@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::chunk::{Chunk, RetrievedChunk};
 
+// Arbitrary value, no real source
 const NAMESPACE: Uuid = Uuid::from_u128(0x6f8f_2a10_9c3e_4b7a_8d2f_1a0e_5c6b_7d8e);
 
 pub struct QdrantStore {
@@ -76,23 +77,18 @@ impl QdrantStore {
             .await
             .map_err(QdrantStoreError::QdrantProcessError)?;
 
-        let info_vector_size: Option<u64> = match info.result {
-            None => None,
-            Some(res) => match res.config {
-                None => None,
-                Some(config) => match config.params {
-                    None => None,
-                    Some(params) => match params.vectors_config {
-                        None => None,
-                        Some(vec_config) => match vec_config.config {
-                            None => None,
-                            Some(Config::Params(vec_params)) => Some(vec_params.size),
-                            Some(Config::ParamsMap(map)) => map.map.values().next().map(|v| v.size),
-                        },
-                    },
-                },
-            },
+        let info_vector_size: Option<u64> = match info
+            .result
+            .and_then(|res| res.config)
+            .and_then(|config| config.params)
+            .and_then(|params| params.vectors_config)
+            .and_then(|vec_config| vec_config.config)
+        {
+            Some(Config::Params(vec_params)) => Some(vec_params.size),
+            Some(Config::ParamsMap(map)) => map.map.values().next().map(|v| v.size),
+            _ => None,
         };
+
         if let Some(actual) = info_vector_size
             && actual != vector_size
         {
