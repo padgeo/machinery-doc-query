@@ -3,43 +3,26 @@ use std::fmt::Debug;
 use crate::cli::ConnectionArgs;
 use url::Url;
 
+#[derive(custom_debug::Debug)]
 pub struct AppConfig {
     azure_openai_endpoint: String,
     #[allow(dead_code)] // will be used in the future
+    #[debug(skip)]
     azure_openai_api_key: String,
     azure_openai_api_version: String,
     azure_openai_embedding_deployment: String,
     azure_openai_chat_deployment: String,
     pub qdrant_url: Url,
+    #[debug(skip)]
     pub qdrant_api_key: Option<String>,
     pub qdrant_collection: String,
     pub embedding_dimensions: u16,
 }
 
-impl Debug for AppConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AppConfig")
-            .field("azure_openai_endpoint", &self.azure_openai_endpoint)
-            .field("azure_openai_api_key", &"[REDACTED]")
-            .field("azure_openai_api_version", &self.azure_openai_api_version)
-            .field(
-                "azure_openai_embedding_deployment",
-                &self.azure_openai_embedding_deployment,
-            )
-            .field(
-                "azure_openai_chat_deployment",
-                &self.azure_openai_chat_deployment,
-            )
-            .field("qdrant_url", &self.qdrant_url)
-            .field("qdrant_api_key", &"[REDACTED]")
-            .field("qdrant_collection", &self.qdrant_collection)
-            .field("embedding_dimensions", &self.embedding_dimensions)
-            .finish()
-    }
-}
+impl TryFrom<ConnectionArgs> for AppConfig {
+    type Error = ConfigError;
 
-impl AppConfig {
-    pub fn try_from(cargs: ConnectionArgs) -> Result<Self, ConfigError> {
+    fn try_from(cargs: ConnectionArgs) -> Result<Self, Self::Error> {
         let azure_openai_endpoint = cargs.endpoint.ok_or(ConfigError::Missing {
             field: "azure_openai_endpoint",
             env_var: "AZURE_OPENAI_ENDPOINT",
