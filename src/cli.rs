@@ -117,8 +117,8 @@ async fn process_ingest(
     chunk_size: u16,
     chunk_overlap: u16,
     recreate_collection: bool,
+    batch_size: u16,
     // these will be used in the future
-    #[allow(unused)] batch_size: u16,
     #[allow(unused)] dry_run: bool,
     connection: ConnectionArgs,
 ) -> Result<(), Error> {
@@ -147,6 +147,7 @@ async fn process_ingest(
         &store,
         &collection,
         &provider,
+        batch_size.into(),
         &chunk_options,
         recreate,
     )

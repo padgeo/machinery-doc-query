@@ -90,6 +90,7 @@ pub async fn run<P: EmbeddingProvider>(
     store: &QdrantStore,
     collection: &str,
     provider: &P,
+    batch_size: usize,
     chunk_options: &ChunkOptions,
     recreate: bool,
 ) -> Result<IngestSummary> {
@@ -127,13 +128,14 @@ pub async fn run<P: EmbeddingProvider>(
         .ensure_collection(collection, vector_size, recreate)
         .await
         .context("Ensure collection failed")?;
-    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-    let embeddings = provider.embed(&texts).await.context("Embed failed")?;
-    store
-        .upsert_chunks(collection, &chunks, &embeddings)
-        .await
-        .context("Upsert chunks failed")?;
-
+    for batch in chunks.chunks(batch_size.max(1)) {
+        let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
+        let embeddings = provider.embed(&texts).await.context("Embed failed")?;
+        store
+            .upsert_chunks(collection, &chunks, &embeddings)
+            .await
+            .context("Upsert chunks failed")?;
+    }
     Ok(summary)
 }
 
@@ -425,6 +427,7 @@ mod tests {
             &store,
             "unused",
             &provider,
+            3,
             &ChunkOptions::default(),
             false,
         )
@@ -446,6 +449,7 @@ mod tests {
             &store,
             "unused",
             &provider,
+            1,
             &ChunkOptions::default(),
             false,
         )

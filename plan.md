@@ -207,7 +207,26 @@ Each milestone compiles and has passing tests — no big-bang integration at the
 8. **M7 — Polish**: `doctor.rs`; harden the E2E suite (re-ingestion idempotency, multi-doc citation disambiguation, partial-failure ingest, config-error paths, `--help` smoke); error-message pass; README with setup instructions (Docker, Azure env vars, example commands).
    *Verify: full test suite green locally and in CI.*
 
-Explicitly deferred past M7 (don't build unless raised later): colored terminal output, progress bars, payload filtering by source document, streaming chat responses, automatic embedding-dimension detection.
+Explicitly deferred past M7 (don't build unless raised later): colored terminal output, progress bars, payload filtering by source document, streaming chat responses, automatic embedding-dimension detection. Ingest streaming and remote document sources are deferred too, but they are planned rather than optional: see the roadmap below.
+
+---
+
+## Post-M7 roadmap: ingest scaling and remote sources
+
+The PRD scopes ingestion to a local directory, and M0–M7 need nothing more. This section records what was decided about scaling ingestion and about loading documents from online sources (for example Azure Blob Storage or Google Drive), so the reasoning isn't lost. It came out of the PR #5 review (2026-11-10 and 11-11), where comments asked how many PDFs are extracted at once and whether results should be handled as they complete.
+
+**Decision: build it in stages.** Do the cheap, high-value parts alongside the Azure work (items 1 and 2). Defer the streaming pipeline and remote sources until after M7, and start them together when the first remote source is added (items 3 to 5). Why not earlier: M4–M7 are the PRD's deliverables, a streaming pipeline adds backpressure, partial-failure and cancellation concerns, and the batch pipeline is adequate at the scale of a directory of manuals.
+
+1. **Bounded extraction (in PR #5).** At most one extraction per CPU core runs at a time: a `tokio::sync::Semaphore` permit is acquired before each `spawn_blocking`, because Tokio's blocking pool would otherwise run up to 512 at once. Measured on 24 cores with 240 synthetic 4.5 MB PDFs: 0.80 s and 348 MB with the limit, 1.06 s and 1.28 GB without, identical output. Results are still awaited in input order, which keeps the output deterministic and cost nothing at this stage (equal total time in the lab).
+2. **Batch-wise persistence (with M4).** `ingest::run` embeds and upserts one batch at a time, sized by `--batch-size` (default 96), instead of embedding every chunk before storing any. Only one batch of vectors is in memory, progress can be logged per batch, and a failing batch leaves everything before it stored. Re-running stays safe because point IDs are deterministic, but it re-embeds files that are already stored until skip-unchanged exists (item 4). The Azure provider keeps its own request batching as a guard against API input limits.
+3. **Streaming ingest pipeline (after M7).** Take each document through fetch → extract → chunk → embed → upsert as soon as it is ready, with bounded concurrency per stage and backpressure between stages (bounded channels, or a `JoinSet` with a semaphore per stage), and handle results as they complete instead of in input order. Keep the final summary ordered by input index so the output stays deterministic. Worth doing when the first remote source lands, when a corpus can exceed memory or disk, or when runs are long enough that progress and resume matter. Lab evidence for that trigger: handling results as they complete made no difference to total time while the per-result work was trivial, and saved up to the extraction time once every result triggered real async work (6.0 s against 5.2 s on equal PDFs with 20 ms per result, 9.7 s against 5.2 s with one slow PDF listed first), which is the situation a streaming pipeline creates.
+4. **Incremental ingestion (after M7).** Replace-by-document (delete a document's old points when it is re-ingested, which closes the stale-point limitation above) and skip-unchanged (store a content hash or ETag in the payload and skip documents that haven't changed), so reruns cost nothing for unchanged documents.
+5. **Remote sources (after M7).** Add a `DocumentSource` seam (list documents, fetch bytes) when the second source arrives, not before; a trait with one implementation adds nothing. Azure Blob Storage comes first because it keeps documents inside Fexillon's Azure tenant, which is the PRD's data-residency constraint. Google Drive only if that policy allows documents to leave the tenant. Decisions to make at that point:
+   - **Document identity.** Point IDs derive from the path relative to `--input-dir`. A blob or Drive file needs a stable source ID or URI plus a display name for citations. Changing the ID changes every point ID, so it means a re-ingest (`--recreate-collection`), which this plan already accepts.
+   - **Extraction input.** `pdf-extract` parses bytes (`extract_text_from_mem_by_pages`), so only the file read has to move.
+   - **Credentials.** A remote source adds secrets to `AppConfig`, which must stay redacted in `Debug`, plus a choice between managed identity and keys.
+
+Streaming chat responses stay in the deferred list above; that is a separate, smaller feature.
 
 ---
 
@@ -218,6 +237,7 @@ Explicitly deferred past M7 (don't build unless raised later): colored terminal 
 - **`edition = "2024"`** needs a recent toolchain (MSRV ~1.85); installed `rustc` is well above this, but a `rust-toolchain.toml` is worth adding so other machines/CI don't drift onto an incompatible older toolchain.
 - **Structured outputs require a specific Azure deployment** (`gpt-4o-2024-08-06`+/`gpt-4.1`/`gpt-5` family) and API version ≥ `2024-08-01-preview`. If Fexillon's real Azure resource has an older model deployed, chat calls fail immediately — `doctor` catches this early via a minimal smoke request.
 - **Point-count drift across re-ingestion with different chunk parameters** — `--recreate-collection` is the documented escape hatch rather than building point-diffing/GC.
+- **Memory during ingest** — the extracted text of every PDF is held until chunking finishes, and a vector is about 4–5 times the size of the chunk text it belongs to (1,536 numbers, 6 KB, against roughly 1.3 KB of text). Embedding and upserting one batch at a time (`--batch-size`) removes most of that ceiling, and holding the text of one directory is acceptable at the PRD's scale. The streaming pipeline in the roadmap removes the rest.
 - **No authentication layer**, by PRD design — the CLI relies on host/network-level trust; worth stating explicitly since "sensitive documents" could otherwise be conflated with "the CLI enforces access control."
 
 ---
