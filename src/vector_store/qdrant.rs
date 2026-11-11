@@ -113,6 +113,15 @@ impl QdrantStore {
         chunks: &[Chunk],
         embeddings: &[Vec<f32>],
     ) -> Result<(), QdrantStoreError> {
+        if chunks.len() != embeddings.len() {
+            return Err(QdrantStoreError::InputError {
+                msg: format!(
+                    "Size mismatch between chunks ({}) and embeddings ({})",
+                    chunks.len(),
+                    embeddings.len()
+                ),
+            });
+        }
         let points: Result<Vec<PointStruct>, QdrantStoreError> = chunks
             .iter()
             .zip(embeddings)

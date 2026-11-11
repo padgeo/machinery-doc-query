@@ -5,7 +5,7 @@
 ### How ingestion scales today
 
 - **Extraction is bounded.** At most one PDF per CPU core is parsed at a time, so memory and thread count stay flat however many PDFs a directory holds. On a 24-core machine, 240 synthetic 4.5 MB PDFs took 0.8 s and 348 MB with the limit, against 1.1 s and 1.3 GB without it, and the extracted text was identical.
-- **Embedding and storing are batched.** Chunks are embedded and upserted `--batch-size` at a time (default 96), so only one batch of vectors is in memory, progress is visible per batch, and a failure keeps everything stored before it. Re-running `ingest` is safe: point IDs are derived from the file and chunk index, so existing points are updated in place.
+- **Embedding and storing are batched.** Chunks are embedded and upserted `--batch-size` at a time (default 96), so only one batch of vectors is in memory and a failure keeps everything stored before it. Re-running `ingest` is safe: point IDs are derived from the file and chunk index, so existing points are updated in place.
 - **A bad file doesn't stop the run.** Every PDF ends up as succeeded, skipped (no extractable text) or failed. The exit code is 1 only when nothing was ingested.
 
 ### Known limits
