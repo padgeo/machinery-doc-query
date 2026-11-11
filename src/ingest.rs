@@ -132,7 +132,7 @@ pub async fn run<P: EmbeddingProvider>(
         let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
         let embeddings = provider.embed(&texts).await.context("Embed failed")?;
         store
-            .upsert_chunks(collection, &batch, &embeddings)
+            .upsert_chunks(collection, batch, &embeddings)
             .await
             .context("Upsert chunks failed")?;
     }
