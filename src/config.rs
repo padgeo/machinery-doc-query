@@ -7,16 +7,20 @@ use url::Url;
 pub struct AppConfig {
     azure_openai_endpoint: String,
     #[allow(dead_code)] // will be used in the future
-    #[debug(skip)]
+    #[debug(with = redacted)]
     azure_openai_api_key: String,
     azure_openai_api_version: String,
     azure_openai_embedding_deployment: String,
     azure_openai_chat_deployment: String,
     pub qdrant_url: Url,
-    #[debug(skip)]
+    #[debug(with = redacted)]
     pub qdrant_api_key: Option<String>,
     pub qdrant_collection: String,
     pub embedding_dimensions: u16,
+}
+
+fn redacted<T>(_: &T, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+    f.write_str("[REDACTED]")
 }
 
 impl TryFrom<ConnectionArgs> for AppConfig {

@@ -1,8 +1,10 @@
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use glob::glob;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -11,7 +13,9 @@ use crate::chunk::{Chunk, ChunkOptions, chunk_pages};
 use crate::pdf::extract::extract_pages;
 use crate::vector_store::qdrant::QdrantStore;
 
-type ExtractOutcome = Result<(PathBuf, Vec<String>), (PathBuf, String)>;
+type ExtractHandle = (PathBuf, JoinHandle<ExtractOutcome>);
+type ExtractOutcome = Result<ExtractResultOk, (PathBuf, String)>;
+type ExtractResultOk = (PathBuf, Vec<String>);
 
 #[derive(Default)]
 pub struct IngestSummary {
@@ -150,22 +154,48 @@ fn collect_pdfs(input_dir: &PathBuf) -> Result<Vec<PathBuf>, IngestError> {
     }
 }
 
-async fn extract_pdfs(pdfs: Vec<PathBuf>) -> (Vec<(PathBuf, Vec<String>)>, IngestSummary) {
-    // The path is kept next to the handle so that even a panicking extraction
-    // task can be reported by file name.
-    let handles: Vec<(PathBuf, JoinHandle<ExtractOutcome>)> = pdfs
-        .into_iter()
-        .map(|pdf_path| {
-            let reported_path = pdf_path.clone();
-            let handle = tokio::task::spawn_blocking(move || match extract_pages(&pdf_path) {
+async fn extract_pdfs(pdfs: Vec<PathBuf>) -> (Vec<ExtractResultOk>, IngestSummary) {
+    // Parsing is CPU- and memory-bound, and spawn_blocking alone would run up to
+    // 512 at once. A permit per core keeps memory and threads flat.
+    let limit = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let permits = Arc::new(Semaphore::new(limit));
+    let mut summary = IngestSummary::new();
+    let handles = extraction_handles(pdfs, &mut summary, &permits).await;
+    let all_pages = perform_extraction(handles, &mut summary).await;
+    (all_pages, summary)
+}
+
+async fn extraction_handles(
+    paths: Vec<PathBuf>,
+    summary: &mut IngestSummary,
+    permits: &Arc<Semaphore>,
+) -> Vec<ExtractHandle> {
+    let mut handles: Vec<ExtractHandle> = Vec::with_capacity(paths.len());
+    for pdf_path in paths {
+        let Ok(permit) = permits.clone().acquire_owned().await else {
+            summary
+                .failed
+                .push((pdf_path, "extraction limiter was closed".to_string()));
+            continue;
+        };
+
+        let reported_path = pdf_path.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let _permit = permit; // released when the extraction finishes or panics
+            match extract_pages(&pdf_path) {
                 Ok(pages) => Ok((pdf_path, pages)),
                 Err(e) => Err((pdf_path, e.to_string())),
-            });
-            (reported_path, handle)
-        })
-        .collect();
+            }
+        });
+        handles.push((reported_path, handle));
+    }
+    handles
+}
 
-    let mut summary = IngestSummary::new();
+async fn perform_extraction(
+    handles: Vec<ExtractHandle>,
+    summary: &mut IngestSummary,
+) -> Vec<ExtractResultOk> {
     let mut all_pages = Vec::new();
     for (reported_path, handle) in handles {
         match handle.await {
@@ -198,10 +228,10 @@ async fn extract_pdfs(pdfs: Vec<PathBuf>) -> (Vec<(PathBuf, Vec<String>)>, Inges
             )),
         }
     }
-    (all_pages, summary)
+    all_pages
 }
 
-fn chunk_all_pages(all_pages: Vec<(PathBuf, Vec<String>)>, options: &ChunkOptions) -> Vec<Chunk> {
+fn chunk_all_pages(all_pages: Vec<ExtractResultOk>, options: &ChunkOptions) -> Vec<Chunk> {
     all_pages
         .iter()
         .flat_map(|(source_file, pages)| {
@@ -423,5 +453,159 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{err:#}").contains("/definitely/not/a/real/dir"));
+    }
+
+    // A handle that is already running a closure which returns `outcome`, like the real ones.
+    fn extraction_returning(path: &str, outcome: ExtractOutcome) -> ExtractHandle {
+        (
+            PathBuf::from(path),
+            tokio::task::spawn_blocking(move || outcome),
+        )
+    }
+
+    // acquire only fails on a closed semaphore. That has to fail the file, not panic.
+    #[tokio::test]
+    async fn a_closed_limiter_fails_the_files_instead_of_panicking() {
+        let permits = Arc::new(Semaphore::new(1));
+        permits.close();
+        let mut summary = IngestSummary::new();
+
+        let handles = extraction_handles(
+            vec![PathBuf::from("never_read.pdf")],
+            &mut summary,
+            &permits,
+        )
+        .await;
+
+        assert!(handles.is_empty());
+        assert_eq!(summary.failed.len(), 1);
+        assert_eq!(summary.failed[0].0, PathBuf::from("never_read.pdf"));
+        assert!(summary.failed[0].1.contains("limiter was closed"));
+    }
+
+    // The permit lives inside the extraction closure, so every way a file can end
+    // (extracted, no text, unreadable) has to give it back.
+    #[tokio::test]
+    #[rstest]
+    async fn every_permit_is_handed_back_once_the_extractions_finish(
+        generated_test_pdfs: TestPdfs,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_pdf = dir.path().join("not_a_pdf.pdf");
+        std::fs::write(&not_a_pdf, b"this is not a pdf").unwrap();
+        let pdfs = vec![
+            generated_test_pdfs.path(BOILER),
+            generated_test_pdfs.path(NO_TEXT),
+            not_a_pdf,
+        ];
+        let permits = Arc::new(Semaphore::new(3));
+        let mut summary = IngestSummary::new();
+
+        let handles = extraction_handles(pdfs, &mut summary, &permits).await;
+        perform_extraction(handles, &mut summary).await;
+
+        assert_eq!(permits.available_permits(), 3);
+    }
+
+    // With one permit every file waits for the previous one to hand its permit back, so a
+    // permit that is never released would hang here. The timeout turns that hang into a failure.
+    #[tokio::test]
+    #[rstest]
+    async fn a_limit_of_one_still_extracts_every_file(generated_test_pdfs: TestPdfs) {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_pdf = dir.path().join("not_a_pdf.pdf");
+        std::fs::write(&not_a_pdf, b"this is not a pdf").unwrap();
+        let pdfs = vec![
+            generated_test_pdfs.path(BOILER),
+            not_a_pdf.clone(),
+            generated_test_pdfs.path(PUMP),
+        ];
+        let permits = Arc::new(Semaphore::new(1));
+        let mut summary = IngestSummary::new();
+
+        let pages = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let handles = extraction_handles(pdfs, &mut summary, &permits).await;
+            perform_extraction(handles, &mut summary).await
+        })
+        .await
+        .expect("extraction hung: a permit was never handed back");
+
+        assert_eq!(pages.len(), 2);
+        assert_eq!(summary.failed.len(), 1);
+        assert_eq!(summary.failed[0].0, not_a_pdf);
+    }
+
+    // A panic inside the parser reaches us as a JoinError. It has to come out as a failed
+    // file with its name, and the other files must carry on.
+    #[tokio::test]
+    async fn a_panicking_extraction_is_reported_by_file_name() {
+        let boom: ExtractHandle = (
+            PathBuf::from("boom.pdf"),
+            tokio::task::spawn_blocking(|| -> ExtractOutcome { panic!("parser blew up") }),
+        );
+        let fine = extraction_returning(
+            "fine.pdf",
+            Ok((PathBuf::from("fine.pdf"), vec!["some text".to_string()])),
+        );
+        let mut summary = IngestSummary::new();
+
+        let pages = perform_extraction(vec![boom, fine], &mut summary).await;
+
+        assert_eq!(pages.len(), 1);
+        assert_eq!(summary.succeeded, vec![PathBuf::from("fine.pdf")]);
+        assert_eq!(summary.failed.len(), 1);
+        assert_eq!(summary.failed[0].0, PathBuf::from("boom.pdf"));
+        assert!(summary.failed[0].1.contains("extraction task panicked"));
+        assert!(summary.failed[0].1.contains("parser blew up"));
+    }
+
+    #[tokio::test]
+    async fn results_keep_the_input_order_even_when_the_first_file_finishes_last() {
+        let slow: ExtractHandle = (
+            PathBuf::from("slow.pdf"),
+            tokio::task::spawn_blocking(|| -> ExtractOutcome {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                Ok((PathBuf::from("slow.pdf"), vec!["some text".to_string()]))
+            }),
+        );
+        let fast = extraction_returning(
+            "fast.pdf",
+            Ok((PathBuf::from("fast.pdf"), vec!["some text".to_string()])),
+        );
+        let mut summary = IngestSummary::new();
+
+        let pages = perform_extraction(vec![slow, fast], &mut summary).await;
+
+        let order: Vec<PathBuf> = pages.into_iter().map(|(path, _)| path).collect();
+        assert_eq!(
+            order,
+            vec![PathBuf::from("slow.pdf"), PathBuf::from("fast.pdf")]
+        );
+        assert_eq!(summary.succeeded, order);
+    }
+
+    // A blank page in the middle stays in place, so the pages after it keep their real numbers.
+    #[tokio::test]
+    async fn a_pdf_with_a_blank_page_is_kept_with_every_page_in_place() {
+        let partly_blank = extraction_returning(
+            "partly_blank.pdf",
+            Ok((
+                PathBuf::from("partly_blank.pdf"),
+                vec![
+                    "first".to_string(),
+                    "  \n ".to_string(),
+                    "third".to_string(),
+                ],
+            )),
+        );
+        let mut summary = IngestSummary::new();
+
+        let pages = perform_extraction(vec![partly_blank], &mut summary).await;
+
+        assert_eq!(summary.succeeded, vec![PathBuf::from("partly_blank.pdf")]);
+        assert!(summary.skipped.is_empty());
+        assert!(summary.failed.is_empty());
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].1.len(), 3);
     }
 }
