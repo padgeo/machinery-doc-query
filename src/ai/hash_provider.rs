@@ -3,11 +3,11 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use crate::ai::provider::{EmbeddingProvider, ProviderError};
 
 pub struct HashProvider {
-    pub dimensions: usize,
+    pub dimensions: u16,
 }
 
 impl HashProvider {
-    fn embed_one(text: &str, dimensions: usize) -> Vec<f32> {
+    fn embed_one(text: &str, dimensions: u16) -> Vec<f32> {
         let mut hasher = DefaultHasher::new();
         text.hash(&mut hasher);
         let mut vector: Vec<f32> = (0..dimensions)
@@ -37,7 +37,7 @@ impl EmbeddingProvider for HashProvider {
         Ok(embedded)
     }
 
-    fn embedded_dimensions(&self) -> usize {
+    fn embedded_dimensions(&self) -> u16 {
         self.dimensions
     }
 }
@@ -46,7 +46,7 @@ impl EmbeddingProvider for HashProvider {
 mod tests {
     use super::*;
 
-    fn provider(dimensions: usize) -> HashProvider {
+    fn provider(dimensions: u16) -> HashProvider {
         HashProvider { dimensions }
     }
 

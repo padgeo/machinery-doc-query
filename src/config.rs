@@ -5,13 +5,12 @@ use url::Url;
 
 #[derive(custom_debug::Debug)]
 pub struct AppConfig {
-    azure_openai_endpoint: String,
-    #[allow(dead_code)] // will be used in the future
+    pub azure_openai_endpoint: String,
     #[debug(with = redacted)]
-    azure_openai_api_key: String,
-    azure_openai_api_version: String,
-    azure_openai_embedding_deployment: String,
-    azure_openai_chat_deployment: String,
+    pub azure_openai_api_key: String,
+    pub azure_openai_api_version: String,
+    pub azure_openai_embedding_deployment: String,
+    pub azure_openai_chat_deployment: String,
     pub qdrant_url: Url,
     #[debug(with = redacted)]
     pub qdrant_api_key: Option<String>,
@@ -91,6 +90,8 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use crate::cli::ProviderKind::Hash;
+
     use super::*;
 
     fn valid_connection_args() -> ConnectionArgs {
@@ -104,6 +105,7 @@ mod tests {
             qdrant_api_key: None,
             qdrant_collection: "machinery_docs".to_string(),
             embedding_dimensions: 1536,
+            provider_kind: Hash,
         }
     }
 

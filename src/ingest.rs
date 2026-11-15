@@ -123,7 +123,7 @@ pub async fn run<P: EmbeddingProvider>(
         return Ok(summary);
     }
 
-    let vector_size = u64::try_from(provider.embedded_dimensions()).context("Conversion error")?;
+    let vector_size = From::from(provider.embedded_dimensions());
     store
         .ensure_collection(collection, vector_size, recreate)
         .await
