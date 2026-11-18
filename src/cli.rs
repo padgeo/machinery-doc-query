@@ -1,10 +1,22 @@
 use crate::{
-    ai::hash_provider::HashProvider, chunk::ChunkOptions, config::AppConfig, ingest,
+    ai::{
+        azure_provider::{AzureEmbeddingSettings, AzureOpenAiProvider},
+        hash_provider::HashProvider,
+        provider::Provider,
+    },
+    chunk::ChunkOptions,
+    config::AppConfig,
     vector_store::qdrant::QdrantStore,
 };
 use anyhow::{Context, Error, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+#[derive(ValueEnum, Clone, Debug)]
+pub enum ProviderKind {
+    Azure,
+    Hash,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "machinery-doc-query")]
@@ -77,6 +89,8 @@ pub struct ConnectionArgs {
     pub qdrant_collection: String,
     #[arg(long, env = "EMBEDDING_DIMENSIONS", default_value_t = 1536)]
     pub embedding_dimensions: u16,
+    #[arg(long, env = "EMBEDDING_PROVIDER", value_enum, default_value_t = ProviderKind::Azure)]
+    pub provider_kind: ProviderKind,
 }
 
 pub async fn open_cli() -> Result<()> {
@@ -118,21 +132,18 @@ async fn process_ingest(
     chunk_overlap: u16,
     recreate_collection: bool,
     batch_size: u16,
-    // these will be used in the future
+    // this will be used in the future
     #[allow(unused)] dry_run: bool,
     connection: ConnectionArgs,
 ) -> Result<(), Error> {
+    let provider_kind = connection.provider_kind.clone();
     let app_config = AppConfig::try_from(connection)?;
     let store = QdrantStore::connect(
         app_config.qdrant_url.as_str(),
         app_config.qdrant_api_key.as_deref(),
     )
     .context("QdrantStore error occurred")?;
-    let collection = app_config.qdrant_collection;
-    // clippy note: converting `u16` to `usize` cannot fail
-    let dimensions = usize::from(app_config.embedding_dimensions);
-    let provider = HashProvider { dimensions };
-
+    let collection = &app_config.qdrant_collection;
     // clippy note: converting `u16` to `usize` cannot fail
     let chunk_size = usize::from(chunk_size);
     let overlap = usize::from(chunk_overlap);
@@ -142,10 +153,20 @@ async fn process_ingest(
     };
     let recreate = recreate_collection;
 
-    let summary = ingest::run::<HashProvider>(
+    let provider = match provider_kind {
+        ProviderKind::Azure => Provider::Azure(Box::new(AzureOpenAiProvider::new(
+            AzureEmbeddingSettings::from(&app_config),
+            app_config.embedding_dimensions,
+            batch_size,
+        ))),
+        ProviderKind::Hash => Provider::Hash(HashProvider {
+            dimensions: app_config.embedding_dimensions,
+        }),
+    };
+    let summary = crate::ingest::run::<Provider>(
         &input_dir,
         &store,
-        &collection,
+        collection,
         &provider,
         batch_size.into(),
         &chunk_options,
@@ -177,7 +198,8 @@ fn process_doctor(connection: ConnectionArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::error::ErrorKind;
+    use clap::{CommandFactory, error::ErrorKind};
+    use rstest::rstest;
 
     // Note: the connection flags also read real environment variables
     // (QDRANT_URL etc.), so these tests only assert on non-env arguments.
@@ -292,5 +314,71 @@ mod tests {
     fn doctor_needs_no_arguments() {
         let cli = parse(&["doctor"]).unwrap();
         assert!(matches!(cli.command, Commands::Doctor { .. }));
+    }
+
+    // ---- embedding provider ----
+
+    #[test]
+    fn the_provider_defaults_to_azure() {
+        // Read the declared default instead of parsing: parsing would also pick
+        // up EMBEDDING_PROVIDER from the environment of whoever runs the tests.
+        let command = Cli::command();
+        let ingest = command.find_subcommand("ingest").unwrap();
+        let provider = ingest
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == "provider_kind")
+            .expect("the provider flag exists");
+
+        let defaults: Vec<String> = provider
+            .get_default_values()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(defaults, vec!["azure"]);
+    }
+
+    // The flag beats the environment variable, so these two do not depend on
+    // what is set where the tests run.
+    #[test]
+    fn the_provider_flag_accepts_azure() {
+        let cli = parse(&["ingest", "-i", "pdfs", "--provider-kind", "azure"]).unwrap();
+        let Commands::Ingest { connection, .. } = cli.command else {
+            panic!("expected the ingest command");
+        };
+
+        assert!(matches!(connection.provider_kind, ProviderKind::Azure));
+    }
+
+    // query has to embed the question with the same provider that ingested the
+    // documents, so every command takes the flag.
+    #[rstest]
+    #[case::ingest(&["ingest", "-i", "pdfs"])]
+    #[case::query(&["query", "a question"])]
+    #[case::doctor(&["doctor"])]
+    fn every_command_accepts_the_provider_flag(#[case] args: &[&str]) {
+        let mut args = args.to_vec();
+        args.extend(["--provider-kind", "hash"]);
+
+        let cli = parse(&args).unwrap();
+
+        let connection = match cli.command {
+            Commands::Ingest { connection, .. }
+            | Commands::Query { connection, .. }
+            | Commands::Doctor { connection } => connection,
+        };
+        assert!(matches!(connection.provider_kind, ProviderKind::Hash));
+    }
+
+    #[test]
+    fn an_unknown_provider_is_rejected_and_the_choices_are_listed() {
+        let err = parse(&["ingest", "-i", "pdfs", "--provider-kind", "ollama"]).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidValue);
+        let message = err.to_string();
+        assert!(
+            message.contains("azure") && message.contains("hash"),
+            "the error should list the valid choices, got: {message}"
+        );
     }
 }

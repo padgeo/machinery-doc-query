@@ -39,8 +39,9 @@ src/
     qdrant.rs                — QdrantStore (connect / create-or-validate collection / upsert / search), deterministic point-ID derivation, QdrantStoreError
   ai/
     mod.rs
-    provider.rs               — EmbeddingProvider + ChatProvider traits (native async-fn-in-trait), ProviderError
-    azure_openai.rs            — AzureOpenAiProvider (two Client<AzureConfig> instances: embedding + chat deployments), retry/backoff wrapper
+    provider.rs               — EmbeddingProvider + ChatProvider traits (native async-fn-in-trait), ProviderError, the `Provider` enum that picks Azure or hash at runtime (async fns in traits are not object-safe)
+    azure_provider.rs          — AzureOpenAiProvider: the embeddings half in M4 (batching, ordering and size checks, per-request timeout); the chat half joins in M6 with a second Client<AzureConfig> for the chat deployment
+    retry.rs                   — retry() helper: exponential backoff, the caller decides which errors are transient
     schema.rs                  — StructuredAnswer/Step/Source types + the JSON Schema constant for response_format
     prompt.rs                  — system/user message construction
   ingest.rs                 — orchestration: walk dir → extract → chunk → batch-embed → upsert; IngestSummary (partial-failure tolerant)
@@ -137,7 +138,7 @@ Prompt construction (`ai/prompt.rs`) is a pure function of `(question, &[Retriev
 
 **Qdrant integration tests** (`tests/qdrant_integration.rs`) — `testcontainers` crate with a hand-configured `GenericImage::new("qdrant/qdrant", "v1.19.0")` (no ready-made `testcontainers-modules` Qdrant module exists). One shared container per test binary (lazy `OnceCell`), each test uses its own collection. Hand-crafted fake `Vec<f32>` embeddings — this layer never touches Azure. Covers: idempotent collection creation, upsert-then-search, re-upsert-updates-in-place (proves the re-ingestion design), vector-size-mismatch error, top-k respected.
 
-**Azure OpenAI integration tests** (`tests/azure_openai_mock.rs`) — `wiremock`, pointed to via `AzureConfig::with_api_base(&mock_server.uri())`; never hits real Azure. Fixtures include a normal embeddings response, a chat-completion response whose `content` is a JSON-encoded string matching our schema (the nested-JSON-in-a-string detail that's easy to get wrong), a refusal variant, a malformed-content variant, and 429/500 fixtures to test the `backoff` retry wrapper. One test asserts the actual outgoing request included `response_format: json_schema` and the Azure `api-key` header — testing that structured outputs are invoked correctly, not just that responses parse.
+**Azure OpenAI integration tests** (`tests/azure_openai_mock.rs`) — `wiremock`, pointed to via `AzureConfig::with_api_base(&mock_server.uri())`; never hits real Azure. Fixtures include a normal embeddings response, a chat-completion response whose `content` is a JSON-encoded string matching our schema (the nested-JSON-in-a-string detail that's easy to get wrong), a refusal variant, a malformed-content variant, and 429/5xx fixtures to test the retry behaviour (the embeddings half of this lives in the `ai::azure_provider` unit tests). One test asserts the actual outgoing request included `response_format: json_schema` and the Azure `api-key` header — testing that structured outputs are invoked correctly, not just that responses parse.
 
 **End-to-end CLI tests** (`tests/cli_e2e.rs`) — `assert_cmd` + `predicates` against the real compiled binary, wired to the testcontainers Qdrant + wiremock Azure. Covers: `ingest` happy path (verified independently against Qdrant), `ingest` run twice → point count unchanged, `query` happy path asserting step text **+ warning text + source filename** together (the single test tying the whole pipeline to the PRD's actual success criteria), no-match query → graceful message not a crash, missing/invalid config → clean non-zero exit, `--help` smoke test, `doctor` happy/failure paths, and a partial-failure ingest (one good + one corrupt file → good file still ingested, bad file reported, exit code 0).
 
@@ -163,7 +164,6 @@ dotenvy = "0.15.7"
 url = "2.5.8"
 anyhow = "1.0.104"
 thiserror = "2.0.20"
-backoff = { version = "0.4.0", features = ["tokio"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
@@ -195,13 +195,13 @@ Each milestone compiles and has passing tests — no big-bang integration at the
 4. **M3 — Qdrant + ingest plumbing**: `vector_store/qdrant.rs` real; `ingest.rs` wired to `Commands::Ingest`, but using a `#[cfg(test)]`-only fake `EmbeddingProvider` (deterministic hash-derived vector) so Qdrant correctness is tested independently of Azure. `ai::provider` traits introduced now (small, cheap) even though the real Azure impl lands in M4.
    *Tests: Qdrant integration tests via testcontainers; `ingest::run()` tested as a library call.*
 
-5. **M4 — Azure embeddings**: `ai/azure_openai.rs` embeddings half only (chat half deferred to M6); `backoff` retry wrapper; real `AzureOpenAiProvider` replaces the fake at the composition root.
-   *Tests: wiremock embeddings tests, 429-retry test; first true `assert_cmd` E2E `ingest` test (real binary + testcontainers Qdrant + wiremock embeddings).*
+5. **M4 — Azure embeddings**: `ai/azure_provider.rs` embeddings half only (chat half deferred to M6). The OpenAI client already retries 429, 5xx and connect errors (3 retries, `Retry-After` honoured), so `ai/retry.rs` plus a per-request timeout only cover what it leaves alone: timeouts and other transport errors. `--provider-kind azure|hash` picks the real or the hash provider at the composition root.
+   *Tests: wiremock embeddings tests (request shape, batching, ordering, 429/503/401/timeout behaviour). Still to do, needs Docker: the first true `assert_cmd` E2E `ingest` test (real binary + testcontainers Qdrant + wiremock embeddings).*
 
 6. **M5 — Retrieval-only query**: `query.rs` embeds the question, searches Qdrant, prints raw ranked chunks (no LLM generation yet) — a deliberate stepping stone that validates retrieval quality independent of generation.
    *Tests: ranking/top-k correctness, E2E test asserting raw retrieved text appears for a matching question.*
 
-7. **M6 — Full answer generation**: `ai/azure_openai.rs` chat half + `ai/schema.rs` + `ai/prompt.rs` + `render.rs`; `query.rs` updated to replace the M5 raw dump with the real structured, formatted answer.
+7. **M6 — Full answer generation**: `ai/azure_provider.rs` chat half + `ai/schema.rs` + `ai/prompt.rs` + `render.rs`; `query.rs` updated to replace the M5 raw dump with the real structured, formatted answer.
    *Tests: wiremock chat tests (happy/refusal/malformed/request-shape), prompt/schema/render unit tests, and the E2E test asserting steps + inline warning + source filename together — first point the PRD's full success criteria are demonstrable end-to-end.*
 
 8. **M7 — Polish**: `doctor.rs`; harden the E2E suite (re-ingestion idempotency, multi-doc citation disambiguation, partial-failure ingest, config-error paths, `--help` smoke); error-message pass; README with setup instructions (Docker, Azure env vars, example commands).
@@ -233,7 +233,7 @@ Streaming chat responses stay in the deferred list above; that is a separate, sm
 ## Risks / assumptions (documented, not blockers)
 
 - **No OCR** (`pdf-extract`) — scanned/image-only PDFs yield empty text; assumed text-layer PDFs per the PRD's own stack choice. Mitigated by making this a tested, documented behavior rather than a silent failure.
-- **Azure rate limits** during large batch ingestion — mitigated by request batching (96 chunks/call) plus `backoff`-based retry on 429/5xx only (never retrying 4xx config errors like 401).
+- **Azure rate limits** during large batch ingestion — mitigated by request batching (96 chunks/call) plus the OpenAI client's own retry on 429, 5xx and connect errors (3 retries, `Retry-After` honoured); 4xx config errors like 401 are never retried.
 - **`edition = "2024"`** needs a recent toolchain (MSRV ~1.85); installed `rustc` is well above this, but a `rust-toolchain.toml` is worth adding so other machines/CI don't drift onto an incompatible older toolchain.
 - **Structured outputs require a specific Azure deployment** (`gpt-4o-2024-08-06`+/`gpt-4.1`/`gpt-5` family) and API version ≥ `2024-08-01-preview`. If Fexillon's real Azure resource has an older model deployed, chat calls fail immediately — `doctor` catches this early via a minimal smoke request.
 - **Point-count drift across re-ingestion with different chunk parameters** — `--recreate-collection` is the documented escape hatch rather than building point-diffing/GC.
