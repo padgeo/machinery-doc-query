@@ -185,6 +185,8 @@ impl QdrantStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+    use std::path::PathBuf;
 
     #[test]
     fn point_id_is_deterministic() {
@@ -243,6 +245,65 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Qdrant vector size mismatch found: expected 1536 but found 1500"
+        );
+    }
+
+    // ---- upsert_chunks: chunks and embeddings are paired by position ----
+
+    fn chunk(chunk_index: usize) -> Chunk {
+        Chunk {
+            source_file: PathBuf::from("manual.pdf"),
+            page_number: 1,
+            chunk_index,
+            text: format!("chunk {chunk_index}"),
+        }
+    }
+
+    // zip() silently drops the longer side, so a different number of chunks and
+    // embeddings would store the wrong vector with the wrong text. It has to fail
+    // before anything is sent. Nothing listens on port 1: a request would fail with
+    // a connection error, so getting an InputError proves none was made.
+    #[rstest]
+    #[case::fewer_embeddings(2, 1)]
+    #[case::more_embeddings(1, 2)]
+    #[case::no_embeddings(2, 0)]
+    #[tokio::test]
+    async fn upsert_chunks_rejects_a_different_number_of_embeddings(
+        #[case] chunk_count: usize,
+        #[case] embedding_count: usize,
+    ) {
+        let store = QdrantStore::connect("http://127.0.0.1:1", None).unwrap();
+        let chunks: Vec<Chunk> = (0..chunk_count).map(chunk).collect();
+        let embeddings = vec![vec![0.0_f32; 4]; embedding_count];
+
+        let err = store
+            .upsert_chunks("unused", &chunks, &embeddings)
+            .await
+            .unwrap_err();
+
+        let expected = format!("chunks ({chunk_count}) and embeddings ({embedding_count})");
+        assert!(
+            matches!(&err, QdrantStoreError::InputError { msg } if msg.contains(&expected)),
+            "got {err:?}"
+        );
+    }
+
+    // The guard must not turn valid input away: with matching counts the call gets
+    // as far as the network, which is refused here.
+    #[tokio::test]
+    async fn upsert_chunks_with_matching_counts_gets_past_the_guard() {
+        let store = QdrantStore::connect("http://127.0.0.1:1", None).unwrap();
+        let chunks = vec![chunk(0), chunk(1)];
+        let embeddings = vec![vec![0.0_f32; 4]; 2];
+
+        let err = store
+            .upsert_chunks("unused", &chunks, &embeddings)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, QdrantStoreError::QdrantProcessError(_)),
+            "got {err:?}"
         );
     }
 }
