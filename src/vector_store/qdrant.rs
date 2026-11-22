@@ -7,7 +7,7 @@ use qdrant_client::{
 };
 use uuid::Uuid;
 
-use crate::chunk::{Chunk, RetrievedChunk};
+use crate::chunk::{Chunk, RetrievedChunk, RetrievedChunkError};
 
 // Arbitrary value, no real source
 const NAMESPACE: Uuid = Uuid::from_u128(0x6f8f_2a10_9c3e_4b7a_8d2f_1a0e_5c6b_7d8e);
@@ -24,6 +24,8 @@ pub enum QdrantStoreError {
     VectorSizeMismatch { expected: u64, actual: u64 },
     #[error("Qdrant input error: {msg}")]
     InputError { msg: String },
+    #[error("Qdrant returned a point that cannot be read: {0}")]
+    MalformedPoint(#[from] RetrievedChunkError),
 }
 
 impl QdrantStore {
@@ -174,11 +176,12 @@ impl QdrantStore {
             )
             .await
             .map_err(QdrantStoreError::QdrantProcessError)?;
-        Ok(response
+        let chunks = response
             .result
             .into_iter()
-            .map(RetrievedChunk::from)
-            .collect())
+            .map(RetrievedChunk::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(chunks)
     }
 }
 

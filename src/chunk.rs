@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use qdrant_client::qdrant::{ScoredPoint, Value};
 
@@ -6,6 +9,14 @@ pub const SOURCE_KEY: &str = "source_file";
 pub const PAGE_KEY: &str = "page_number";
 pub const CHUNK_KEY: &str = "chunk_index";
 pub const TEXT_KEY: &str = "text";
+
+#[derive(thiserror::Error, Debug, PartialEq)]
+pub enum RetrievedChunkError {
+    #[error("the stored point has no usable {0:?} in its payload")]
+    MissingField(&'static str),
+    #[error("payload field {field:?} holds {value}, which is not a valid number")]
+    InvalidNumber { field: &'static str, value: i64 },
+}
 
 pub struct Chunk {
     pub source_file: PathBuf, // relative
@@ -29,37 +40,46 @@ impl Default for ChunkOptions {
     }
 }
 
-#[allow(unused)] // Will be used in the future
 pub struct RetrievedChunk {
-    chunk: Chunk,
-    score: f32,
+    pub chunk: Chunk,
+    pub score: f32,
 }
 
-impl From<ScoredPoint> for RetrievedChunk {
-    fn from(scored_point: ScoredPoint) -> Self {
+impl RetrievedChunk {
+    fn get_usize_value(
+        payload: &HashMap<String, Value>,
+        field: &'static str,
+    ) -> Result<usize, RetrievedChunkError> {
+        let Some(value) = payload.get(field).and_then(Value::as_integer) else {
+            Err(RetrievedChunkError::MissingField(field))?
+        };
+
+        usize::try_from(value).map_err(|_| RetrievedChunkError::InvalidNumber { field, value })
+    }
+}
+
+impl TryFrom<ScoredPoint> for RetrievedChunk {
+    type Error = RetrievedChunkError;
+
+    fn try_from(scored_point: ScoredPoint) -> Result<Self, Self::Error> {
         let payload = scored_point.payload;
 
         let source_file = payload
             .get(SOURCE_KEY)
             .and_then(Value::as_str)
-            .map_or_default(PathBuf::from);
+            .map(PathBuf::from)
+            .ok_or(RetrievedChunkError::MissingField(SOURCE_KEY))?;
 
-        let page_number = payload
-            .get(PAGE_KEY)
-            .and_then(Value::as_integer)
-            .map_or_default(|i| usize::try_from(i).unwrap());
-
-        let chunk_index = payload
-            .get(CHUNK_KEY)
-            .and_then(Value::as_integer)
-            .map_or_default(|i| usize::try_from(i).unwrap());
+        let page_number = Self::get_usize_value(&payload, PAGE_KEY)?;
+        let chunk_index = Self::get_usize_value(&payload, CHUNK_KEY)?;
 
         let text = payload
             .get(TEXT_KEY)
             .and_then(Value::as_str)
-            .map_or_default(|s| s.to_owned());
+            .map(|s| s.to_owned())
+            .ok_or(RetrievedChunkError::MissingField(TEXT_KEY))?;
 
-        RetrievedChunk {
+        Ok(RetrievedChunk {
             chunk: Chunk {
                 source_file,
                 page_number,
@@ -67,7 +87,7 @@ impl From<ScoredPoint> for RetrievedChunk {
                 text,
             },
             score: scored_point.score,
-        }
+        })
     }
 }
 
@@ -135,6 +155,7 @@ fn find_break(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     // ---- safe_boundary ----
 
@@ -350,5 +371,105 @@ mod tests {
         let chunks = chunk_pages(&PathBuf::from("multibyte.pdf"), &pages, &options);
         assert!(!chunks.is_empty());
         assert!(chunks.iter().any(|c| c.text.contains('\u{b0}')));
+    }
+
+    // ---- RetrievedChunk::try_from ----
+
+    fn point(fields: &[(&str, Value)]) -> ScoredPoint {
+        ScoredPoint {
+            payload: fields
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.clone()))
+                .collect(),
+            score: 0.75,
+            ..Default::default()
+        }
+    }
+
+    fn full_payload() -> Vec<(&'static str, Value)> {
+        vec![
+            (SOURCE_KEY, Value::from("boiler.pdf")),
+            (PAGE_KEY, Value::from(3_i64)),
+            (CHUNK_KEY, Value::from(7_i64)),
+            (TEXT_KEY, Value::from("Open the drain valve.")),
+        ]
+    }
+
+    // The full payload with one field's value replaced.
+    fn payload_with(field: &str, value: Value) -> Vec<(&'static str, Value)> {
+        full_payload()
+            .into_iter()
+            .map(|(key, original)| {
+                if key == field {
+                    (key, value.clone())
+                } else {
+                    (key, original)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_complete_point_converts_with_every_field() {
+        let retrieved = RetrievedChunk::try_from(point(&full_payload())).unwrap();
+
+        assert_eq!(retrieved.chunk.source_file, PathBuf::from("boiler.pdf"));
+        assert_eq!(retrieved.chunk.page_number, 3);
+        assert_eq!(retrieved.chunk.chunk_index, 7);
+        assert_eq!(retrieved.chunk.text, "Open the drain valve.");
+        assert_eq!(retrieved.score, 0.75);
+    }
+
+    // A missing field is an error that names it. A silent default (no file name, page
+    // 0, empty text) would reach the user later as if it were real data.
+    #[rstest]
+    #[case::source_file(SOURCE_KEY)]
+    #[case::page_number(PAGE_KEY)]
+    #[case::chunk_index(CHUNK_KEY)]
+    #[case::text(TEXT_KEY)]
+    fn a_missing_field_is_named_in_the_error(#[case] missing: &'static str) {
+        let fields: Vec<_> = full_payload()
+            .into_iter()
+            .filter(|(key, _)| *key != missing)
+            .collect();
+
+        let err = RetrievedChunk::try_from(point(&fields))
+            .err()
+            .expect("a point with a missing field should be refused");
+
+        assert_eq!(err, RetrievedChunkError::MissingField(missing));
+    }
+
+    // usize::try_from(-1) used to be unwrapped, which panics.
+    #[rstest]
+    #[case::page_number(PAGE_KEY)]
+    #[case::chunk_index(CHUNK_KEY)]
+    fn a_negative_number_is_an_error_not_a_panic(#[case] field: &'static str) {
+        let fields = payload_with(field, Value::from(-1_i64));
+
+        let err = RetrievedChunk::try_from(point(&fields))
+            .err()
+            .expect("a negative number should be refused");
+
+        assert_eq!(err, RetrievedChunkError::InvalidNumber { field, value: -1 });
+    }
+
+    // A value of another type is as good as no value.
+    #[rstest]
+    #[case::source_file_as_number(SOURCE_KEY, Value::from(1_i64))]
+    #[case::page_number_as_text(PAGE_KEY, Value::from("three"))]
+    #[case::chunk_index_as_text(CHUNK_KEY, Value::from("seven"))]
+    #[case::text_as_number(TEXT_KEY, Value::from(5_i64))]
+    fn a_field_of_the_wrong_type_counts_as_missing(
+        #[case] field: &'static str,
+        #[case] wrong: Value,
+    ) {
+        let fields = payload_with(field, wrong);
+
+        let err = RetrievedChunk::try_from(point(&fields))
+            .err()
+            .expect("a value of the wrong type should be refused");
+
+        assert_eq!(err, RetrievedChunkError::MissingField(field));
     }
 }
