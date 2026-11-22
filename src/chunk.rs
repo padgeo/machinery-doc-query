@@ -51,7 +51,7 @@ impl RetrievedChunk {
         field: &'static str,
     ) -> Result<usize, RetrievedChunkError> {
         let Some(value) = payload.get(field).and_then(Value::as_integer) else {
-            Err(RetrievedChunkError::MissingField(field))?
+            return Err(RetrievedChunkError::MissingField(field));
         };
 
         usize::try_from(value).map_err(|_| RetrievedChunkError::InvalidNumber { field, value })
