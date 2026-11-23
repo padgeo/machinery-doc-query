@@ -1,7 +1,9 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
-    ai::provider::EmbeddingProvider, chunk::RetrievedChunk, vector_store::qdrant::QdrantStore,
+    ai::provider::EmbeddingProvider,
+    chunk::RetrievedChunk,
+    vector_store::qdrant::{QdrantStore, QdrantStoreError},
 };
 
 pub async fn embed_question<P: EmbeddingProvider>(
@@ -41,11 +43,33 @@ pub async fn run<P: EmbeddingProvider>(
     if top_k == 0 {
         bail!("top_k must be larger than 0")
     }
+
     let embedded_question = embed_question(provider, question).await?;
+
+    store
+        .verify_collection(collection, u64::from(provider.embedded_dimensions()))
+        .await
+        .map_err(|err| explain_collection_error(err, collection))?;
+
     store
         .search(collection, embedded_question, top_k)
         .await
         .with_context(|| format!("Failed to search collection {}", collection))
+}
+
+fn explain_collection_error(err: QdrantStoreError, collection: &str) -> anyhow::Error {
+    match err {
+        QdrantStoreError::CollectionDoesntExist(_) => {
+            anyhow!("Collection \"{collection}\" does not exist. Run ingest first.")
+        }
+        // expected is the size this provider makes, actual is the size the collection holds.
+        QdrantStoreError::VectorSizeMismatch { expected, actual } => anyhow!(
+            "The collection holds {actual}-number vectors but this provider makes {expected}. Use the provider that ingested the documents."
+        ),
+        other => {
+            anyhow::Error::new(other).context(format!("Failed to check collection {collection}"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -89,8 +113,9 @@ mod tests {
         }
     }
 
-    // Nothing listens on port 1, so a search that is attempted fails with a connection
-    // error. An error from anywhere else shows that no search was attempted.
+    // Nothing listens on port 1, so any call to Qdrant (the collection check, the
+    // search) fails with a connection error. An error from anywhere else shows that
+    // Qdrant was never contacted.
     fn unreachable_store() -> QdrantStore {
         QdrantStore::connect("http://127.0.0.1:1", None).unwrap()
     }
@@ -182,8 +207,8 @@ mod tests {
         assert!(err.to_string().contains("top_k"), "got {err:#}");
     }
 
-    // The error keeps the provider's own message, and no search is attempted: a search
-    // would have failed with an error that names the collection.
+    // The error keeps the provider's own message, and Qdrant is not contacted: the
+    // collection check would have failed with an error that names the collection.
     #[tokio::test]
     async fn a_failing_provider_stops_the_query_before_qdrant_is_contacted() {
         let err = run(
@@ -226,8 +251,11 @@ mod tests {
         assert!(!chain.contains("boiler_docs"), "got {chain}");
     }
 
+    // With Qdrant down, the collection check is the first call that fails. The error
+    // has to name the collection and must not claim that it is missing, because
+    // running ingest would not help.
     #[tokio::test]
-    async fn a_failed_search_names_the_collection() {
+    async fn qdrant_being_down_is_not_mistaken_for_a_missing_collection() {
         let err = run(
             "question",
             &unreachable_store(),
@@ -239,6 +267,56 @@ mod tests {
         .err()
         .unwrap();
 
-        assert!(format!("{err:#}").contains("boiler_docs"), "got {err:#}");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("boiler_docs"), "got {chain}");
+        assert!(!chain.contains("does not exist"), "got {chain}");
+    }
+
+    // ---- explain_collection_error ----
+
+    #[test]
+    fn a_missing_collection_is_explained() {
+        let err = explain_collection_error(
+            QdrantStoreError::CollectionDoesntExist("boiler_docs".to_owned()),
+            "boiler_docs",
+        );
+
+        assert_eq!(
+            err.to_string(),
+            "Collection \"boiler_docs\" does not exist. Run ingest first."
+        );
+    }
+
+    // expected is the size this provider makes, actual is the size the collection holds.
+    #[test]
+    fn a_size_mismatch_names_both_sizes_the_right_way_round() {
+        let err = explain_collection_error(
+            QdrantStoreError::VectorSizeMismatch {
+                expected: 3,
+                actual: 4,
+            },
+            "boiler_docs",
+        );
+
+        assert_eq!(
+            err.to_string(),
+            "The collection holds 4-number vectors but this provider makes 3. Use the provider that ingested the documents."
+        );
+    }
+
+    // Anything else is not advice, but it still has to say what was being done and
+    // keep the cause.
+    #[test]
+    fn any_other_error_names_the_collection_and_keeps_its_cause() {
+        let err = explain_collection_error(
+            QdrantStoreError::InputError {
+                msg: "the cause".to_owned(),
+            },
+            "boiler_docs",
+        );
+
+        let chain = format!("{err:#}");
+        assert!(chain.contains("boiler_docs"), "got {chain}");
+        assert!(chain.contains("the cause"), "got {chain}");
     }
 }

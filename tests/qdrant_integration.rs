@@ -14,7 +14,7 @@ use machinery_doc_query::{
         provider::{EmbeddingProvider, ProviderError},
     },
     chunk::{Chunk, ChunkOptions},
-    ingest,
+    ingest, query,
     vector_store::qdrant::{QdrantStore, QdrantStoreError},
 };
 use qdrant_client::{
@@ -314,10 +314,12 @@ async fn search_returns_at_most_top_k_results() {
     assert_eq!(all.len(), 3);
 }
 
-// What the query command will have to turn into friendly messages. The wording comes
-// from Qdrant itself, so pinning it here shows when an upgrade changes it.
+// search fails loudly: a missing collection or a vector of the wrong size must never
+// look like "no matching passages". The query command checks both before it searches,
+// so this is what is left if the collection changes in between. The wording is
+// Qdrant's own and nothing here depends on it.
 #[tokio::test]
-async fn searching_a_missing_collection_is_an_error_that_says_so() {
+async fn searching_a_missing_collection_is_an_error() {
     let store = QdrantStore::connect(qdrant_url(), None).unwrap();
 
     let err = store
@@ -330,11 +332,10 @@ async fn searching_a_missing_collection_is_an_error_that_says_so() {
         matches!(err, QdrantStoreError::QdrantProcessError(_)),
         "got {err:?}"
     );
-    assert!(err.to_string().contains("doesn't exist"), "got: {err}");
 }
 
 #[tokio::test]
-async fn a_query_vector_of_the_wrong_size_is_an_error_that_says_so() {
+async fn a_query_vector_of_the_wrong_size_is_an_error() {
     let store = QdrantStore::connect(qdrant_url(), None).unwrap();
     store
         .ensure_collection("wrong_query_size", SIZE, false)
@@ -351,7 +352,6 @@ async fn a_query_vector_of_the_wrong_size_is_an_error_that_says_so() {
         matches!(err, QdrantStoreError::QdrantProcessError(_)),
         "got {err:?}"
     );
-    assert!(err.to_string().contains("dimension"), "got: {err}");
 }
 
 // ---- the ingest pipeline on a real collection ----
@@ -425,4 +425,122 @@ async fn a_failing_provider_leaves_an_existing_collection_alone_even_with_recrea
     let points = stored(&client(), "kept").await;
     assert_eq!(points.len(), 1, "the old collection was dropped");
     assert_eq!(points[0].text, "what was already stored");
+}
+
+// ---- the query path on a real collection ----
+
+// HashProvider gives equal texts equal vectors, so a question that is the exact text
+// of a stored chunk has that chunk's vector, and the chunk has to come first with a
+// similarity of 1. That runs the whole path: embed, check the collection, search and
+// convert what comes back. top_k (3) and the vector size (HASH_SIZE) differ, so using
+// one for the other cannot go unnoticed.
+#[tokio::test]
+async fn a_question_equal_to_a_stored_text_finds_that_chunk_first() {
+    let store = QdrantStore::connect(qdrant_url(), None).unwrap();
+    let provider = HashProvider {
+        dimensions: HASH_SIZE,
+    };
+    ingest_fixtures(&store, "query_round_trip", &provider, 96).await;
+    let texts: Vec<String> = stored(&client(), "query_round_trip")
+        .await
+        .into_iter()
+        .map(|point| point.text)
+        .collect();
+    assert_eq!(texts.len(), 3, "the two readable manuals hold 3 chunks");
+
+    for text in &texts {
+        let found = query::run(text, &store, "query_round_trip", &provider, 3)
+            .await
+            .unwrap();
+
+        assert_eq!(found.len(), 3);
+        assert_eq!(&found[0].chunk.text, text);
+        assert!(found[0].score >= 0.999, "score was {}", found[0].score);
+    }
+}
+
+// top_k is the number of passages the user asked for, and run() has to hand it on.
+#[tokio::test]
+async fn a_query_returns_as_many_passages_as_top_k_asks_for() {
+    let store = QdrantStore::connect(qdrant_url(), None).unwrap();
+    let provider = HashProvider {
+        dimensions: HASH_SIZE,
+    };
+    ingest_fixtures(&store, "query_top_k", &provider, 96).await;
+
+    for top_k in 1..=3_u64 {
+        let found = query::run(
+            "how do I drain the boiler?",
+            &store,
+            "query_top_k",
+            &provider,
+            top_k,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(found.len() as u64, top_k, "top_k was {top_k}");
+    }
+}
+
+// query only reads. A collection that was never ingested has to be reported, and
+// asking about it must not create it, which ensure_collection would.
+#[tokio::test]
+async fn querying_a_collection_that_was_never_ingested_says_to_ingest_and_creates_nothing() {
+    let store = QdrantStore::connect(qdrant_url(), None).unwrap();
+    let provider = HashProvider {
+        dimensions: HASH_SIZE,
+    };
+
+    let err = query::run(
+        "how do I drain the boiler?",
+        &store,
+        "no_such_manuals",
+        &provider,
+        3,
+    )
+    .await
+    .err()
+    .expect("a missing collection is an error");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("no_such_manuals")
+            && message.contains("does not exist")
+            && message.contains("ingest"),
+        "got {err:#}"
+    );
+    assert!(
+        !client().collection_exists("no_such_manuals").await.unwrap(),
+        "the query created the collection"
+    );
+}
+
+// The collection holds 4-number vectors and this provider makes 3: both sizes have to
+// be named, the right way round.
+#[tokio::test]
+async fn querying_with_a_provider_of_another_size_names_both_sizes() {
+    let store = QdrantStore::connect(qdrant_url(), None).unwrap();
+    store
+        .ensure_collection("holds_four", SIZE, false)
+        .await
+        .unwrap();
+    let provider = HashProvider { dimensions: 3 };
+
+    let err = query::run(
+        "how do I drain the boiler?",
+        &store,
+        "holds_four",
+        &provider,
+        3,
+    )
+    .await
+    .err()
+    .expect("a provider of another size is refused");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("holds 4-number vectors") && message.contains("makes 3"),
+        "got {err:#}"
+    );
 }

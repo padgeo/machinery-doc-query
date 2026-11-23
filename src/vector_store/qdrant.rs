@@ -18,6 +18,8 @@ pub struct QdrantStore {
 
 #[derive(thiserror::Error, Debug)]
 pub enum QdrantStoreError {
+    #[error("Qdrant collection with name {0} doesn't exist")]
+    CollectionDoesntExist(String),
     #[error("Qdrant build error occurred: {0:?}")]
     QdrantProcessError(#[source] QdrantError),
     #[error("Qdrant vector size mismatch found: expected {expected} but found {actual}")]
@@ -48,11 +50,7 @@ impl QdrantStore {
         vector_size: u64,
         recreate: bool,
     ) -> Result<(), QdrantStoreError> {
-        let exists = self
-            .client
-            .collection_exists(name)
-            .await
-            .map_err(QdrantStoreError::QdrantProcessError)?;
+        let exists = self.verify_collection_exists(name).await?;
 
         if exists && recreate {
             self.client
@@ -72,34 +70,67 @@ impl QdrantStore {
             return Ok(());
         }
 
-        // existing collection, not recreating: validate instead of assuming
+        self.verify_vector_size(name, vector_size).await
+    }
+
+    /// Read-only check that `name` exists and holds vectors of `expected_size`
+    /// numbers. Unlike `ensure_collection` it never creates anything, so a query
+    /// can use it without leaving a collection behind
+    pub async fn verify_collection(
+        &self,
+        name: &str,
+        expected_size: u64,
+    ) -> Result<(), QdrantStoreError> {
+        if !self.verify_collection_exists(name).await? {
+            return Err(QdrantStoreError::CollectionDoesntExist(name.to_owned()));
+        }
+        self.verify_vector_size(name, expected_size).await
+    }
+
+    async fn get_vector_size(
+        &self,
+        collection_name: &str,
+    ) -> Result<Option<u64>, QdrantStoreError> {
         let info = self
             .client
-            .collection_info(name)
+            .collection_info(collection_name)
             .await
             .map_err(QdrantStoreError::QdrantProcessError)?;
 
-        let info_vector_size: Option<u64> = match info
+        match info
             .result
             .and_then(|res| res.config)
             .and_then(|config| config.params)
             .and_then(|params| params.vectors_config)
             .and_then(|vec_config| vec_config.config)
         {
-            Some(Config::Params(vec_params)) => Some(vec_params.size),
-            Some(Config::ParamsMap(map)) => map.map.values().next().map(|v| v.size),
-            _ => None,
-        };
+            Some(Config::Params(vec_params)) => Ok(Some(vec_params.size)),
+            Some(Config::ParamsMap(map)) => Ok(map.map.values().next().map(|v| v.size)),
+            _ => Ok(None),
+        }
+    }
 
-        if let Some(actual) = info_vector_size
-            && actual != vector_size
+    async fn verify_vector_size(
+        &self,
+        collection_name: &str,
+        expected: u64,
+    ) -> Result<(), QdrantStoreError> {
+        if let Some(actual) = self.get_vector_size(collection_name).await?
+            && actual != expected
         {
-            return Err(QdrantStoreError::VectorSizeMismatch {
-                expected: vector_size,
-                actual,
-            });
+            return Err(QdrantStoreError::VectorSizeMismatch { expected, actual });
         }
         Ok(())
+    }
+
+    async fn verify_collection_exists(
+        &self,
+        collection_name: &str,
+    ) -> Result<bool, QdrantStoreError> {
+        self.client
+            .collection_exists(collection_name)
+            .await
+            .map_err(QdrantStoreError::QdrantProcessError)
     }
 
     fn point_id(source_file: &str, chunk_index: usize) -> Uuid {
@@ -307,6 +338,29 @@ mod tests {
         assert!(
             matches!(err, QdrantStoreError::QdrantProcessError(_)),
             "got {err:?}"
+        );
+    }
+
+    // Ok(false) means "no such collection". An Err means Qdrant could not be asked at
+    // all, and with nothing listening on port 1 that has to come back as the connection
+    // problem, never as a claim that the collection is missing.
+    #[tokio::test]
+    async fn collection_checks_with_qdrant_down_are_process_errors() {
+        let store = QdrantStore::connect("http://127.0.0.1:1", None).unwrap();
+
+        let verify = store.verify_collection("unused", 4).await.unwrap_err();
+        let ensure = store
+            .ensure_collection("unused", 4, false)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(verify, QdrantStoreError::QdrantProcessError(_)),
+            "got {verify:?}"
+        );
+        assert!(
+            matches!(ensure, QdrantStoreError::QdrantProcessError(_)),
+            "got {ensure:?}"
         );
     }
 }
