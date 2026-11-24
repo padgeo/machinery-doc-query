@@ -10,7 +10,7 @@ use crate::{
     vector_store::qdrant::QdrantStore,
 };
 use anyhow::{Context, Error, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum, value_parser};
 use std::{fmt::Display, path::PathBuf};
 
 const DEFAULT_BATCH_SIZE: u16 = 96;
@@ -56,9 +56,9 @@ enum Commands {
         connection: ConnectionArgs,
     },
     Query {
-        // positional - no #[arg], clap treats an unattributed field as one
+        #[arg(value_parser = parse_question)]
         question: String,
-        #[arg(short, long, default_value_t = 5)]
+        #[arg(short, long, default_value_t = 5, value_parser = value_parser!(u16).range(1..))]
         top_k: u16,
         #[command(flatten)]
         connection: ConnectionArgs,
@@ -67,6 +67,16 @@ enum Commands {
         #[command(flatten)]
         connection: ConnectionArgs,
     },
+}
+
+// A question with nothing in it is a usage error (the usage text, exit code 2), not a
+// failure after connecting to Qdrant. The question is kept exactly as it was typed.
+fn parse_question(raw: &str) -> Result<String, String> {
+    if raw.trim().is_empty() {
+        Err("the question must not be blank".to_owned())
+    } else {
+        Ok(raw.to_owned())
+    }
 }
 
 #[derive(Args, Debug)]
@@ -340,6 +350,49 @@ mod tests {
             panic!("expected the query command");
         };
         assert_eq!(top_k, 3);
+    }
+
+    // ---- input that clap refuses ----
+
+    // query::run refuses a top_k of 0 as well, and Qdrant would, but a usage error comes
+    // first: it says what is wrong with the command line before anything is connected.
+    // 65536 is the first number that does not fit the u16 of the field.
+    #[rstest]
+    #[case::zero(&["--top-k", "0"])]
+    #[case::zero_with_the_short_flag(&["-t", "0"])]
+    #[case::too_large_for_a_u16(&["--top-k", "65536"])]
+    #[case::not_a_number(&["--top-k", "many"])]
+    fn query_rejects_a_top_k_outside_1_to_65535(#[case] top_k_args: &[&str]) {
+        let mut args = vec!["query", "a question"];
+        args.extend(top_k_args);
+
+        let err = parse(&args).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    // Both ends of the range are allowed. The value parser has to produce the type of the
+    // field (u16): one of another type makes reading the field panic.
+    #[rstest]
+    #[case::smallest("1", 1)]
+    #[case::largest("65535", 65535)]
+    fn query_accepts_a_top_k_from_1_to_65535(#[case] given: &str, #[case] expected: u16) {
+        let cli = parse(&["query", "a question", "--top-k", given]).unwrap();
+
+        let Commands::Query { top_k, .. } = cli.command else {
+            panic!("expected the query command");
+        };
+        assert_eq!(top_k, expected);
+    }
+
+    #[rstest]
+    #[case::empty("")]
+    #[case::spaces("   ")]
+    #[case::tabs_and_newlines("\n\t")]
+    fn query_rejects_a_blank_question(#[case] question: &str) {
+        let err = parse(&["query", question]).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
     }
 
     #[test]

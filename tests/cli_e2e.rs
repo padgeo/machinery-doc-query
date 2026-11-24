@@ -11,6 +11,7 @@ use common::{client, qdrant_url};
 use machinery_doc_query::vector_store::qdrant::QdrantStore;
 use predicates::prelude::*;
 use qdrant_client::qdrant::ScrollPointsBuilder;
+use rstest::rstest;
 use tempfile::TempDir;
 
 // Size of the vectors the hash provider makes in these tests.
@@ -105,6 +106,28 @@ fn ingest_with_qdrant_down_says_so_before_doing_any_work() {
         .stderr(
             predicate::str::starts_with("Error: Cannot reach Qdrant at http://127.0.0.1:1")
                 .and(predicate::str::contains("Is Docker running?")),
+        );
+}
+
+// ---- input that clap refuses (no Docker needed) ----
+
+// A usage error ends the command with exit code 2 before anything is connected. Nothing
+// listens on port 1, so a command that got as far as Qdrant would complain about that
+// instead, with exit code 1.
+#[rstest]
+#[case::top_k_of_zero(&["query", "how do I drain the boiler?", "--top-k", "0"])]
+#[case::blank_question(&["query", "   "])]
+fn input_clap_refuses_is_a_usage_error_before_anything_is_connected(#[case] args: &[&str]) {
+    let folder = tempfile::tempdir().unwrap();
+
+    machinery(&folder, "http://127.0.0.1:1", "docs")
+        .args(args)
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(
+            predicate::str::starts_with("error: ")
+                .and(predicate::str::contains("Cannot reach Qdrant").not()),
         );
 }
 
