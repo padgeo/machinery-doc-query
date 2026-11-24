@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, time::Duration};
 
 use crate::cli::ConnectionArgs;
 use url::Url;
@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub qdrant_api_key: Option<String>,
     pub qdrant_collection: String,
     pub embedding_dimensions: u16,
+    pub request_timeout: Duration,
+    pub max_attempts: u32,
 }
 
 fn redacted<T>(_: &T, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -64,6 +66,8 @@ impl TryFrom<ConnectionArgs> for AppConfig {
             qdrant_api_key: cargs.qdrant_api_key,
             qdrant_collection: cargs.qdrant_collection,
             embedding_dimensions: cargs.embedding_dimensions,
+            request_timeout: Duration::from_secs(cargs.request_timeout_secs),
+            max_attempts: cargs.max_attempts,
         })
     }
 }
@@ -106,6 +110,8 @@ mod tests {
             qdrant_collection: "machinery_docs".to_string(),
             embedding_dimensions: 1536,
             provider_kind: Hash,
+            request_timeout_secs: 120,
+            max_attempts: 5,
         }
     }
 
@@ -128,6 +134,22 @@ mod tests {
         assert_eq!(config.qdrant_api_key, None);
         assert_eq!(config.qdrant_collection, "machinery_docs");
         assert_eq!(config.embedding_dimensions, 1536);
+        assert_eq!(config.request_timeout, Duration::from_secs(120));
+        assert_eq!(config.max_attempts, 5);
+    }
+
+    #[test]
+    fn the_request_timeout_and_attempts_reach_the_config() {
+        let args = ConnectionArgs {
+            request_timeout_secs: 30,
+            max_attempts: 3,
+            ..valid_connection_args()
+        };
+
+        let config = AppConfig::try_from(args).expect("should build config");
+
+        assert_eq!(config.request_timeout, Duration::from_secs(30));
+        assert_eq!(config.max_attempts, 3);
     }
 
     #[test]

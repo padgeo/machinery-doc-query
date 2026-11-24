@@ -258,6 +258,8 @@ mod tests {
             qdrant_api_key: None,
             qdrant_collection: "machinery_docs".to_string(),
             embedding_dimensions: 1536,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            max_attempts: 5,
         }
     }
 
