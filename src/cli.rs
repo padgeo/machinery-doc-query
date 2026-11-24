@@ -1,6 +1,6 @@
 use crate::{
     ai::{
-        azure_provider::{AzureEmbeddingSettings, AzureOpenAiProvider, DEFAULT_REQUEST_TIMEOUT},
+        azure_provider::{AzureOpenAiProvider, DEFAULT_REQUEST_TIMEOUT},
         hash_provider::HashProvider,
         provider::Provider,
         retry::RetryPolicy,
@@ -195,7 +195,10 @@ fn build_provider(
     match provider_kind {
         ProviderKind::Azure => Provider::Azure(Box::new(
             AzureOpenAiProvider::new(
-                AzureEmbeddingSettings::from(app_config),
+                &app_config.azure_openai_endpoint,
+                &app_config.azure_openai_api_key,
+                &app_config.azure_openai_api_version,
+                app_config.azure_openai_embedding_deployment.clone(),
                 app_config.embedding_dimensions,
                 batch_size,
             )
@@ -233,9 +236,13 @@ mod tests {
     use crate::ai::provider::EmbeddingProvider;
     use clap::{CommandFactory, error::ErrorKind};
     use rstest::rstest;
+    use serde_json::json;
     use std::time::Duration;
     use url::Url;
-    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path, query_param},
+    };
 
     // Note: the connection flags also read real environment variables
     // (QDRANT_URL etc.), so these tests only assert on non-env arguments.
@@ -529,5 +536,28 @@ mod tests {
 
         assert!(err.to_string().contains("timed out"), "got: {err}");
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn build_provider_sends_the_configured_key_version_and_embedding_deployment() {
+        let server = MockServer::start().await;
+        let embedding = vec![0.0_f32; 8];
+        Mock::given(method("POST"))
+            .and(path("/openai/deployments/emb-prod/embeddings"))
+            .and(query_param("api-version", "2024-08-01-preview"))
+            .and(header("api-key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list", "model": "text-embedding-3-small",
+                "data": [{"object": "embedding", "index": 0, "embedding": embedding}],
+                "usage": {"prompt_tokens": 1, "total_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = build_provider(&ProviderKind::Azure, &app_config(&server.uri()), 10);
+
+        let vectors = provider.embed(&["some text"]).await.unwrap();
+
+        assert_eq!(vectors.len(), 1);
     }
 }

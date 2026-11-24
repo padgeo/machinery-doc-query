@@ -9,12 +9,9 @@ use async_openai::{
 use thiserror::Error;
 use tokio::time::{error::Elapsed, timeout};
 
-use crate::{
-    ai::{
-        provider::{EmbeddingProvider, ProviderError},
-        retry::{RetryPolicy, retry},
-    },
-    config::AppConfig,
+use crate::ai::{
+    provider::{EmbeddingProvider, ProviderError},
+    retry::{RetryPolicy, retry},
 };
 
 /// How long one embedding request may take before it counts as timed out.
@@ -28,43 +25,27 @@ pub enum RequestError {
     Function(OpenAIError),
 }
 
-pub struct AzureEmbeddingSettings {
-    endpoint: String,
-    api_key: String,
-    api_version: String,
-    deployment: String,
-}
-
-impl From<&AppConfig> for AzureEmbeddingSettings {
-    fn from(value: &AppConfig) -> Self {
-        Self {
-            endpoint: value.azure_openai_endpoint.clone(),
-            api_key: value.azure_openai_api_key.clone(),
-            api_version: value.azure_openai_api_version.clone(),
-            deployment: value.azure_openai_embedding_deployment.clone(),
-        }
-    }
-}
-
 pub struct AzureOpenAiProvider {
-    settings: AzureEmbeddingSettings,
     dimensions: u16,
     batch_size: u16,
     client: Client<AzureConfig>,
+    deployment: String,
     retry_policy: RetryPolicy,
     request_timeout: Duration,
 }
 
 impl AzureOpenAiProvider {
-    pub fn new(settings: AzureEmbeddingSettings, dimensions: u16, batch_size: u16) -> Self {
+    pub fn new(
+        endpoint: &str,
+        api_key: &str,
+        api_version: &str,
+        deployment: String,
+        dimensions: u16,
+        batch_size: u16,
+    ) -> Self {
         Self {
-            client: Self::connect_client(
-                &settings.endpoint.clone(),
-                &settings.api_key.clone(),
-                &settings.api_version.clone(),
-                &settings.deployment.clone(),
-            ),
-            settings,
+            client: Self::connect_client(endpoint, api_key, api_version, &deployment),
+            deployment,
             dimensions,
             batch_size: batch_size.max(1), // place lower limit to prevent panic
             retry_policy: RetryPolicy::default(),
@@ -144,7 +125,7 @@ impl AzureOpenAiProvider {
 
     async fn request_once(&self, batch: &[&str]) -> Result<CreateEmbeddingResponse, OpenAIError> {
         let request = CreateEmbeddingRequestArgs::default()
-            .model(&self.settings.deployment)
+            .model(&self.deployment)
             .input(EmbeddingInput::StringArray(
                 batch.iter().copied().map(String::from).collect(),
             ))
@@ -211,7 +192,6 @@ mod tests {
     use rstest::rstest;
     use serde_json::{Value, json};
     use std::time::Instant;
-    use url::Url;
     use wiremock::{
         Mock, MockServer, Request, Respond, ResponseTemplate,
         matchers::{body_partial_json, header, method, path, query_param},
@@ -224,14 +204,12 @@ mod tests {
     const DEPLOYMENT: &str = "emb-prod";
     const EMBEDDINGS_PATH: &str = "/openai/deployments/emb-prod/embeddings";
 
-    fn provider_at(endpoint: String, dimensions: u16, batch_size: u16) -> AzureOpenAiProvider {
+    fn provider_at(endpoint: &str, dimensions: u16, batch_size: u16) -> AzureOpenAiProvider {
         AzureOpenAiProvider::new(
-            AzureEmbeddingSettings {
-                endpoint,
-                api_key: API_KEY.to_string(),
-                api_version: API_VERSION.to_string(),
-                deployment: DEPLOYMENT.to_string(),
-            },
+            endpoint,
+            API_KEY,
+            API_VERSION,
+            DEPLOYMENT.to_owned(),
             dimensions,
             batch_size,
         )
@@ -245,22 +223,6 @@ mod tests {
 
     fn strs(input: &[String]) -> Vec<&str> {
         input.iter().map(|s| s.as_str()).collect()
-    }
-
-    fn app_config() -> AppConfig {
-        AppConfig {
-            azure_openai_endpoint: "https://my-resource.openai.azure.com".to_string(),
-            azure_openai_api_key: "secret-key".to_string(),
-            azure_openai_api_version: "2024-08-01-preview".to_string(),
-            azure_openai_embedding_deployment: "embeddings-prod".to_string(),
-            azure_openai_chat_deployment: "chat-prod".to_string(),
-            qdrant_url: Url::parse("http://localhost:6334").unwrap(),
-            qdrant_api_key: None,
-            qdrant_collection: "machinery_docs".to_string(),
-            embedding_dimensions: 1536,
-            request_timeout: DEFAULT_REQUEST_TIMEOUT,
-            max_attempts: 5,
-        }
     }
 
     // A response as the crate would deserialize it, built from (index, vector) pairs.
@@ -283,21 +245,9 @@ mod tests {
         }
     }
 
-    // ---- AzureEmbeddingSettings ----
-
-    #[test]
-    fn settings_use_the_embedding_deployment_not_the_chat_one() {
-        let settings = AzureEmbeddingSettings::from(&app_config());
-
-        assert_eq!(settings.endpoint, "https://my-resource.openai.azure.com");
-        assert_eq!(settings.api_key, "secret-key");
-        assert_eq!(settings.api_version, "2024-08-01-preview");
-        assert_eq!(settings.deployment, "embeddings-prod");
-    }
-
     #[test]
     fn embedded_dimensions_is_the_configured_size() {
-        let provider = provider_at("https://my-resource.openai.azure.com".to_string(), 1536, 96);
+        let provider = provider_at("https://my-resource.openai.azure.com", 1536, 96);
 
         assert_eq!(provider.embedded_dimensions(), 1536);
     }
@@ -507,7 +457,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let vectors = provider_at(server.uri(), 4, 10)
+        let vectors = provider_at(&server.uri(), 4, 10)
             .embed(&strs(&texts(2)))
             .await
             .unwrap();
@@ -519,7 +469,7 @@ mod tests {
     async fn embed_splits_the_texts_into_batches() {
         let server = echo_server(4, false).await;
 
-        provider_at(server.uri(), 4, 2)
+        provider_at(&server.uri(), 4, 2)
             .embed(&strs(&texts(5)))
             .await
             .unwrap();
@@ -531,7 +481,7 @@ mod tests {
     async fn embed_keeps_input_order_across_batches_when_the_server_shuffles() {
         let server = echo_server(4, true).await;
 
-        let vectors = provider_at(server.uri(), 4, 2)
+        let vectors = provider_at(&server.uri(), 4, 2)
             .embed(&strs(&texts(5)))
             .await
             .unwrap();
@@ -544,7 +494,7 @@ mod tests {
     async fn embed_with_no_texts_sends_no_request() {
         let server = MockServer::start().await;
 
-        let vectors = provider_at(server.uri(), 4, 10).embed(&[]).await.unwrap();
+        let vectors = provider_at(&server.uri(), 4, 10).embed(&[]).await.unwrap();
 
         assert!(vectors.is_empty());
         assert!(server.received_requests().await.unwrap().is_empty());
@@ -554,7 +504,7 @@ mod tests {
     async fn a_batch_size_of_zero_is_treated_as_one() {
         let server = echo_server(4, false).await;
 
-        let vectors = provider_at(server.uri(), 4, 0)
+        let vectors = provider_at(&server.uri(), 4, 0)
             .embed(&strs(&texts(2)))
             .await
             .unwrap();
@@ -567,7 +517,7 @@ mod tests {
     async fn a_trailing_slash_on_the_endpoint_does_not_double_the_slash() {
         let server = echo_server(4, false).await;
 
-        provider_at(format!("{}/", server.uri()), 4, 10)
+        provider_at(&format!("{}/", server.uri()), 4, 10)
             .embed(&strs(&texts(1)))
             .await
             .unwrap();
@@ -586,7 +536,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = provider_at(server.uri(), 4, 10)
+        let err = provider_at(&server.uri(), 4, 10)
             .embed(&strs(&texts(1)))
             .await
             .unwrap_err();
@@ -602,7 +552,7 @@ mod tests {
         // the server answers with 4 numbers per vector, the provider expects 8
         let server = echo_server(4, false).await;
 
-        let err = provider_at(server.uri(), 8, 10)
+        let err = provider_at(&server.uri(), 8, 10)
             .embed(&strs(&texts(2)))
             .await
             .unwrap_err();
@@ -644,7 +594,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = provider_at(server.uri(), 4, 2)
+        let err = provider_at(&server.uri(), 4, 2)
             .embed(&strs(&texts(6)))
             .await
             .unwrap_err();
@@ -702,7 +652,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let vectors = fast(provider_at(server.uri(), 4, 10))
+        let vectors = fast(provider_at(&server.uri(), 4, 10))
             .embed(&strs(&texts(2)))
             .await
             .unwrap();
@@ -721,7 +671,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = fast(provider_at(server.uri(), 4, 10))
+        let err = fast(provider_at(&server.uri(), 4, 10))
             .embed(&strs(&texts(1)))
             .await
             .unwrap_err();
@@ -743,7 +693,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = fast(provider_at(server.uri(), 4, 10))
+        let err = fast(provider_at(&server.uri(), 4, 10))
             .embed(&strs(&texts(1)))
             .await
             .unwrap_err();
@@ -763,8 +713,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)))
             .mount(&server)
             .await;
-        let provider =
-            fast(provider_at(server.uri(), 4, 10)).with_request_timeout(Duration::from_millis(150));
+        let provider = fast(provider_at(&server.uri(), 4, 10))
+            .with_request_timeout(Duration::from_millis(150));
 
         let err = provider.embed(&strs(&texts(1))).await.unwrap_err();
 
@@ -781,7 +731,7 @@ mod tests {
     // that the retries happened: a single refused try takes a millisecond or two.
     #[tokio::test]
     async fn connection_refused_is_retried_by_the_client_then_reported() {
-        let provider = fast(provider_at("http://127.0.0.1:1".to_string(), 4, 10));
+        let provider = fast(provider_at("http://127.0.0.1:1", 4, 10));
 
         let started = Instant::now();
         let err = provider.embed(&strs(&texts(1))).await.unwrap_err();
@@ -825,7 +775,7 @@ mod tests {
             .mount(&server)
             .await;
         let provider =
-            fast(provider_at(server.uri(), 4, 2)).with_request_timeout(Duration::from_millis(300));
+            fast(provider_at(&server.uri(), 4, 2)).with_request_timeout(Duration::from_millis(300));
 
         let vectors = provider.embed(&strs(&texts(4))).await.unwrap();
 
