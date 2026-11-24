@@ -20,7 +20,7 @@ pub struct QdrantStore {
 pub enum QdrantStoreError {
     #[error("Qdrant collection with name {0} doesn't exist")]
     CollectionDoesntExist(String),
-    #[error("Qdrant build error occurred: {0:?}")]
+    #[error("Qdrant request failed.")]
     QdrantProcessError(#[source] QdrantError),
     #[error("Qdrant vector size mismatch found: expected {expected} but found {actual}")]
     VectorSizeMismatch { expected: u64, actual: u64 },
@@ -32,7 +32,7 @@ pub enum QdrantStoreError {
 
 impl QdrantStore {
     pub fn connect(url: &str, api_key: Option<&str>) -> Result<Self, QdrantStoreError> {
-        let mut builder = Qdrant::from_url(url);
+        let mut builder = Qdrant::from_url(url).skip_compatibility_check();
         if let Some(key) = api_key {
             builder = builder.api_key(key);
         }
@@ -42,6 +42,16 @@ impl QdrantStore {
         Ok(Self {
             client: qdrant_client,
         })
+    }
+
+    /// Asks the server whether it is up. An Err means it could not be reached or did
+    /// not answer, which the caller turns into advice.
+    pub async fn health_check(&self) -> Result<(), QdrantStoreError> {
+        self.client
+            .health_check()
+            .await
+            .map(|_| ())
+            .map_err(QdrantStoreError::QdrantProcessError)
     }
 
     pub async fn ensure_collection(
@@ -361,6 +371,20 @@ mod tests {
         assert!(
             matches!(ensure, QdrantStoreError::QdrantProcessError(_)),
             "got {ensure:?}"
+        );
+    }
+
+    // Nothing listens on port 1, so the server cannot be asked. The caller gets the
+    // connection problem as an error and turns it into advice.
+    #[tokio::test]
+    async fn health_check_with_qdrant_down_is_a_process_error() {
+        let store = QdrantStore::connect("http://127.0.0.1:1", None).unwrap();
+
+        let err = store.health_check().await.unwrap_err();
+
+        assert!(
+            matches!(err, QdrantStoreError::QdrantProcessError(_)),
+            "got {err:?}"
         );
     }
 }

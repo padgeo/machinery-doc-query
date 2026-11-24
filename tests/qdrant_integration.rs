@@ -153,6 +153,18 @@ impl EmbeddingProvider for FailingProvider {
 
 // ---- the collection ----
 
+// The other half of the Docker-free test of the same name: a Qdrant that is up
+// has to pass, or every command would refuse to start.
+#[tokio::test]
+async fn a_running_qdrant_passes_the_health_check() {
+    let store = QdrantStore::connect(qdrant_url(), None).unwrap();
+
+    store
+        .health_check()
+        .await
+        .expect("the test container answers");
+}
+
 #[tokio::test]
 async fn ensure_collection_creates_the_collection_and_can_be_repeated() {
     let store = QdrantStore::connect(qdrant_url(), None).unwrap();
