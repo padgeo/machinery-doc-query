@@ -17,6 +17,9 @@ use crate::{
     config::AppConfig,
 };
 
+/// How long one embedding request may take before it counts as timed out.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_mins(2);
+
 #[derive(Debug, Error)]
 pub enum RequestError {
     #[error("Request timed out: {0}")]
@@ -64,13 +67,22 @@ impl AzureOpenAiProvider {
             settings,
             dimensions,
             batch_size: batch_size.max(1), // place lower limit to prevent panic
-            retry_policy: RetryPolicy {
-                max_attempts: 5,
-                base_delay: Duration::from_millis(10),
-                max_delay: Duration::from_secs(1),
-            },
-            request_timeout: Duration::from_mins(2),
+            retry_policy: RetryPolicy::default(),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
+    }
+
+    /// Replaces how often, and how long between attempts, a timed out or dropped request
+    /// is tried again.
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
+    }
+
+    /// Replaces how long one request may take before it counts as timed out.
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
     }
 
     pub fn connect_client(
@@ -656,13 +668,12 @@ mod tests {
     // timeouts and transport errors; HTTP errors are retried by async-openai itself.
     // The per-request timeout is left at its generous default so a slow test machine
     // cannot trigger it by accident.
-    fn fast(mut provider: AzureOpenAiProvider) -> AzureOpenAiProvider {
-        provider.retry_policy = RetryPolicy {
+    fn fast(provider: AzureOpenAiProvider) -> AzureOpenAiProvider {
+        provider.with_retry_policy(RetryPolicy {
             max_attempts: 3,
             base_delay: Duration::from_millis(1),
             max_delay: Duration::from_millis(5),
-        };
-        provider
+        })
     }
 
     fn api_error(status: u16) -> ResponseTemplate {
@@ -750,8 +761,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)))
             .mount(&server)
             .await;
-        let mut provider = fast(provider_at(server.uri(), 4, 10));
-        provider.request_timeout = Duration::from_millis(150);
+        let provider =
+            fast(provider_at(server.uri(), 4, 10)).with_request_timeout(Duration::from_millis(150));
 
         let err = provider.embed(&strs(&texts(1))).await.unwrap_err();
 
@@ -811,8 +822,8 @@ mod tests {
             .respond_with(echo())
             .mount(&server)
             .await;
-        let mut provider = fast(provider_at(server.uri(), 4, 2));
-        provider.request_timeout = Duration::from_millis(300);
+        let provider =
+            fast(provider_at(server.uri(), 4, 2)).with_request_timeout(Duration::from_millis(300));
 
         let vectors = provider.embed(&strs(&texts(4))).await.unwrap();
 

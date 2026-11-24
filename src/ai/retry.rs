@@ -2,10 +2,23 @@ use std::time::Duration;
 
 use tokio::time::sleep;
 
+/// How often `retry` tries an operation and how long it waits in between. The wait starts
+/// at `base_delay` and doubles up to `max_delay`; `max_attempts` counts the first try, so 1
+/// means no retries.
 pub struct RetryPolicy {
     pub max_attempts: u32,
     pub base_delay: Duration,
     pub max_delay: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_secs(1),
+        }
+    }
 }
 
 pub async fn retry<T, E, Fut>(
