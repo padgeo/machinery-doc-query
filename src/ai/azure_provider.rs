@@ -88,7 +88,7 @@ impl AzureOpenAiProvider {
         )
     }
 
-    pub async fn embed_batch(&self, batch: &[String]) -> Result<Vec<Vec<f32>>, ProviderError> {
+    pub async fn embed_batch(&self, batch: &[&str]) -> Result<Vec<Vec<f32>>, ProviderError> {
         let response = retry(
             &self.retry_policy,
             AzureOpenAiProvider::is_transient,
@@ -102,7 +102,7 @@ impl AzureOpenAiProvider {
 
     async fn attempt_request(
         &self,
-        batch: &[String],
+        batch: &[&str],
     ) -> Result<CreateEmbeddingResponse, RequestError> {
         timeout(self.request_timeout, self.request_once(batch))
             .await
@@ -130,10 +130,12 @@ impl AzureOpenAiProvider {
         }
     }
 
-    async fn request_once(&self, batch: &[String]) -> Result<CreateEmbeddingResponse, OpenAIError> {
+    async fn request_once(&self, batch: &[&str]) -> Result<CreateEmbeddingResponse, OpenAIError> {
         let request = CreateEmbeddingRequestArgs::default()
             .model(&self.settings.deployment)
-            .input(EmbeddingInput::StringArray(batch.to_vec()))
+            .input(EmbeddingInput::StringArray(
+                batch.iter().copied().map(String::from).collect(),
+            ))
             .build()?;
         self.client.embeddings().create(request).await
     }
@@ -173,7 +175,7 @@ impl AzureOpenAiProvider {
 }
 
 impl EmbeddingProvider for AzureOpenAiProvider {
-    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, ProviderError> {
+    async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ProviderError> {
         if texts.is_empty() {
             let empty: Vec<Vec<f32>> = vec![];
             return Ok(empty);
@@ -227,6 +229,10 @@ mod tests {
     // each vector, so a test can tell which text a vector belongs to.
     fn texts(count: usize) -> Vec<String> {
         (0..count).map(|i| format!("text-{i}")).collect()
+    }
+
+    fn strs(input: &[String]) -> Vec<&str> {
+        input.iter().map(|s| s.as_str()).collect()
     }
 
     fn app_config() -> AppConfig {
@@ -488,7 +494,7 @@ mod tests {
             .await;
 
         let vectors = provider_at(server.uri(), 4, 10)
-            .embed(&texts(2))
+            .embed(&strs(&texts(2)))
             .await
             .unwrap();
 
@@ -500,7 +506,7 @@ mod tests {
         let server = echo_server(4, false).await;
 
         provider_at(server.uri(), 4, 2)
-            .embed(&texts(5))
+            .embed(&strs(&texts(5)))
             .await
             .unwrap();
 
@@ -512,7 +518,7 @@ mod tests {
         let server = echo_server(4, true).await;
 
         let vectors = provider_at(server.uri(), 4, 2)
-            .embed(&texts(5))
+            .embed(&strs(&texts(5)))
             .await
             .unwrap();
 
@@ -535,7 +541,7 @@ mod tests {
         let server = echo_server(4, false).await;
 
         let vectors = provider_at(server.uri(), 4, 0)
-            .embed(&texts(2))
+            .embed(&strs(&texts(2)))
             .await
             .unwrap();
 
@@ -548,7 +554,7 @@ mod tests {
         let server = echo_server(4, false).await;
 
         provider_at(format!("{}/", server.uri()), 4, 10)
-            .embed(&texts(1))
+            .embed(&strs(&texts(1)))
             .await
             .unwrap();
 
@@ -567,7 +573,7 @@ mod tests {
             .await;
 
         let err = provider_at(server.uri(), 4, 10)
-            .embed(&texts(1))
+            .embed(&strs(&texts(1)))
             .await
             .unwrap_err();
 
@@ -583,7 +589,7 @@ mod tests {
         let server = echo_server(4, false).await;
 
         let err = provider_at(server.uri(), 8, 10)
-            .embed(&texts(2))
+            .embed(&strs(&texts(2)))
             .await
             .unwrap_err();
 
@@ -625,7 +631,7 @@ mod tests {
             .await;
 
         let err = provider_at(server.uri(), 4, 2)
-            .embed(&texts(6))
+            .embed(&strs(&texts(6)))
             .await
             .unwrap_err();
 
@@ -684,7 +690,7 @@ mod tests {
             .await;
 
         let vectors = fast(provider_at(server.uri(), 4, 10))
-            .embed(&texts(2))
+            .embed(&strs(&texts(2)))
             .await
             .unwrap();
 
@@ -703,7 +709,7 @@ mod tests {
             .await;
 
         let err = fast(provider_at(server.uri(), 4, 10))
-            .embed(&texts(1))
+            .embed(&strs(&texts(1)))
             .await
             .unwrap_err();
 
@@ -725,7 +731,7 @@ mod tests {
             .await;
 
         let err = fast(provider_at(server.uri(), 4, 10))
-            .embed(&texts(1))
+            .embed(&strs(&texts(1)))
             .await
             .unwrap_err();
 
@@ -747,7 +753,7 @@ mod tests {
         let mut provider = fast(provider_at(server.uri(), 4, 10));
         provider.request_timeout = Duration::from_millis(150);
 
-        let err = provider.embed(&texts(1)).await.unwrap_err();
+        let err = provider.embed(&strs(&texts(1))).await.unwrap_err();
 
         assert!(
             matches!(&err, ProviderError::RequestFailed(msg) if msg.contains("timed out")),
@@ -765,7 +771,7 @@ mod tests {
         let provider = fast(provider_at("http://127.0.0.1:1".to_string(), 4, 10));
 
         let started = Instant::now();
-        let err = provider.embed(&texts(1)).await.unwrap_err();
+        let err = provider.embed(&strs(&texts(1))).await.unwrap_err();
 
         assert!(
             matches!(err, ProviderError::RequestFailed(_)),
@@ -808,7 +814,7 @@ mod tests {
         let mut provider = fast(provider_at(server.uri(), 4, 2));
         provider.request_timeout = Duration::from_millis(300);
 
-        let vectors = provider.embed(&texts(4)).await.unwrap();
+        let vectors = provider.embed(&strs(&texts(4))).await.unwrap();
 
         let firsts: Vec<f32> = vectors.iter().map(|v| v[0]).collect();
         assert_eq!(firsts, vec![0.0, 1.0, 2.0, 3.0]);
