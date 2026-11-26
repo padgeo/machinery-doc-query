@@ -225,6 +225,12 @@ The PRD scopes ingestion to a local directory, and M0–M7 need nothing more. Th
    - **Document identity.** Point IDs derive from the path relative to `--input-dir`. A blob or Drive file needs a stable source ID or URI plus a display name for citations. Changing the ID changes every point ID, so it means a re-ingest (`--recreate-collection`), which this plan already accepts.
    - **Extraction input.** `pdf-extract` parses bytes (`extract_text_from_mem_by_pages`), so only the file read has to move.
    - **Credentials.** A remote source adds secrets to `AppConfig`, which must stay redacted in `Debug`, plus a choice between managed identity and keys.
+6. **Remember the embedding provider in the collection (after M7).** Vectors from different embedding models cannot be compared, even when they have the same size, and Qdrant cannot tell them apart: a collection ingested with the `hash` provider and queried with `azure` (both 1536 numbers) returns a meaningless order and no error. M5 will make this visible without preventing it: the `query` output starts with a header line that names the provider kind, and the README tells users to use the same provider for both commands. This follow-up lets the collection carry the answer, so that a mismatch is refused instead of only shown. It is independent of items 1 to 5, and worth doing sooner if a mix-up ever happens in practice.
+   - **Write.** Qdrant keeps free-form metadata on a collection (checked on v1.19). `ensure_collection` passes the provider kind and the embedding deployment name to `CreateCollectionBuilder::metadata(..)` when it creates the collection, so `--recreate-collection` writes it again.
+   - **Read.** `collection_info` returns it as `config.metadata`, the same call `ensure_collection` already makes to check the vector size. `query` compares it with the provider it is about to use, and `doctor` prints it.
+   - **Decide.** A different provider kind is an error ("built with hash, you asked for azure"). A different deployment of the same kind may only warn.
+   - **Old collections.** They have no record: treat them as unknown, search as before and say so in the header.
+   - **Test.** A Docker test creates a collection through `ensure_collection`, reads the metadata back, and checks that a query with the other provider is refused.
 
 Streaming chat responses stay in the deferred list above; that is a separate, smaller feature.
 

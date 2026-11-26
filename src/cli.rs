@@ -7,16 +7,28 @@ use crate::{
     },
     chunk::ChunkOptions,
     config::AppConfig,
+    ingest, query, render,
     vector_store::qdrant::QdrantStore,
 };
 use anyhow::{Context, Error, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use std::path::PathBuf;
+use clap::{Args, Parser, Subcommand, ValueEnum, value_parser};
+use std::{fmt::Display, path::PathBuf};
+
+const DEFAULT_BATCH_SIZE: u16 = 96;
 
 #[derive(ValueEnum, Clone, Debug)]
 pub enum ProviderKind {
     Azure,
     Hash,
+}
+
+impl Display for ProviderKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProviderKind::Azure => f.write_str("azure"),
+            ProviderKind::Hash => f.write_str("hash"),
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -37,7 +49,7 @@ enum Commands {
         chunk_overlap: u16,
         #[arg(short, long)]
         recreate_collection: bool,
-        #[arg(short, long, default_value_t = 96)]
+        #[arg(short, long, default_value_t = DEFAULT_BATCH_SIZE)]
         batch_size: u16,
         #[arg(short, long)]
         dry_run: bool,
@@ -45,9 +57,9 @@ enum Commands {
         connection: ConnectionArgs,
     },
     Query {
-        // positional - no #[arg], clap treats an unattributed field as one
+        #[arg(value_parser = parse_question)]
         question: String,
-        #[arg(short, long, default_value_t = 5)]
+        #[arg(short, long, default_value_t = 5, value_parser = value_parser!(u16).range(1..))]
         top_k: u16,
         #[command(flatten)]
         connection: ConnectionArgs,
@@ -56,6 +68,16 @@ enum Commands {
         #[command(flatten)]
         connection: ConnectionArgs,
     },
+}
+
+// A question with nothing in it is a usage error (the usage text, exit code 2), not a
+// failure after connecting to Qdrant. The question is kept exactly as it was typed.
+fn parse_question(raw: &str) -> Result<String, String> {
+    if raw.trim().is_empty() {
+        Err("the question must not be blank".to_owned())
+    } else {
+        Ok(raw.to_owned())
+    }
 }
 
 #[derive(Args, Debug)]
@@ -138,7 +160,7 @@ pub async fn open_cli() -> Result<()> {
             question,
             top_k,
             connection,
-        } => process_query(question, top_k, connection),
+        } => process_query(question, top_k, connection).await,
         Commands::Doctor { connection } => process_doctor(connection),
     }
 }
@@ -155,11 +177,7 @@ async fn process_ingest(
 ) -> Result<(), Error> {
     let provider_kind = connection.provider_kind.clone();
     let app_config = AppConfig::try_from(connection)?;
-    let store = QdrantStore::connect(
-        app_config.qdrant_url.as_str(),
-        app_config.qdrant_api_key.as_deref(),
-    )
-    .context("QdrantStore error occurred")?;
+    let store = connect_to_qdrant(&app_config).await?;
     let collection = &app_config.qdrant_collection;
     // clippy note: converting `u16` to `usize` cannot fail
     let chunk_size = usize::from(chunk_size);
@@ -171,7 +189,7 @@ async fn process_ingest(
     let recreate = recreate_collection;
 
     let provider = build_provider(&provider_kind, &app_config, batch_size);
-    let summary = crate::ingest::run::<Provider>(
+    let summary = ingest::run::<Provider>(
         &input_dir,
         &store,
         collection,
@@ -214,12 +232,15 @@ fn build_provider(
     }
 }
 
-fn process_query(question: String, top_k: u16, connection: ConnectionArgs) -> Result<()> {
+async fn process_query(question: String, top_k: u16, connection: ConnectionArgs) -> Result<()> {
+    let provider_kind = connection.provider_kind.clone();
     let app_config = AppConfig::try_from(connection)?;
-    println!("{:?}", app_config);
-    println!("'query' was called");
-    drop(question);
-    let _ = top_k;
+    let store = connect_to_qdrant(&app_config).await?;
+    let provider = build_provider(&provider_kind, &app_config, DEFAULT_BATCH_SIZE);
+    let collection = &app_config.qdrant_collection;
+    let chunks = query::run(&question, &store, collection, &provider, top_k as u64).await?;
+    println!("Provider: {provider_kind}");
+    println!("{}", render::render_chunks(&chunks));
     Ok(())
 }
 
@@ -228,6 +249,18 @@ fn process_doctor(connection: ConnectionArgs) -> Result<()> {
     println!("{:?}", app_config);
     println!("'doctor' was called");
     Ok(())
+}
+
+// Connects to Qdrant and asks it to answer, so that a stopped container is reported
+// first, before anything is parsed, embedded or searched.
+async fn connect_to_qdrant(app_config: &AppConfig) -> Result<QdrantStore> {
+    let url = app_config.qdrant_url.as_str();
+    let store = QdrantStore::connect(url, app_config.qdrant_api_key.as_deref())?;
+    store
+        .health_check()
+        .await
+        .with_context(|| format!("Cannot reach Qdrant at {url}. Is Docker running?"))?;
+    Ok(store)
 }
 
 #[cfg(test)]
@@ -353,6 +386,49 @@ mod tests {
         assert_eq!(top_k, 3);
     }
 
+    // ---- input that clap refuses ----
+
+    // query::run refuses a top_k of 0 as well, and Qdrant would, but a usage error comes
+    // first: it says what is wrong with the command line before anything is connected.
+    // 65536 is the first number that does not fit the u16 of the field.
+    #[rstest]
+    #[case::zero(&["--top-k", "0"])]
+    #[case::zero_with_the_short_flag(&["-t", "0"])]
+    #[case::too_large_for_a_u16(&["--top-k", "65536"])]
+    #[case::not_a_number(&["--top-k", "many"])]
+    fn query_rejects_a_top_k_outside_1_to_65535(#[case] top_k_args: &[&str]) {
+        let mut args = vec!["query", "a question"];
+        args.extend(top_k_args);
+
+        let err = parse(&args).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    // Both ends of the range are allowed. The value parser has to produce the type of the
+    // field (u16): one of another type makes reading the field panic.
+    #[rstest]
+    #[case::smallest("1", 1)]
+    #[case::largest("65535", 65535)]
+    fn query_accepts_a_top_k_from_1_to_65535(#[case] given: &str, #[case] expected: u16) {
+        let cli = parse(&["query", "a question", "--top-k", given]).unwrap();
+
+        let Commands::Query { top_k, .. } = cli.command else {
+            panic!("expected the query command");
+        };
+        assert_eq!(top_k, expected);
+    }
+
+    #[rstest]
+    #[case::empty("")]
+    #[case::spaces("   ")]
+    #[case::tabs_and_newlines("\n\t")]
+    fn query_rejects_a_blank_question(#[case] question: &str) {
+        let err = parse(&["query", question]).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
     #[test]
     fn doctor_needs_no_arguments() {
         let cli = parse(&["doctor"]).unwrap();
@@ -425,6 +501,69 @@ mod tests {
         );
     }
 
+    // ---- showing and building the provider ----
+
+    // The header of a query names the provider the way the flag spells it, so it can be
+    // compared with what was typed when the documents were ingested.
+    #[test]
+    fn the_provider_is_shown_the_way_the_flag_spells_it() {
+        for kind in ProviderKind::value_variants() {
+            let flag_value = kind
+                .to_possible_value()
+                .expect("every provider can be chosen with the flag");
+
+            assert_eq!(kind.to_string(), flag_value.get_name());
+        }
+    }
+
+    // The provider kind and config of a query for the given kind, made from flags (which
+    // beat the environment) the way the commands make theirs.
+    fn kind_and_config(provider_kind: &str) -> (ProviderKind, AppConfig) {
+        let cli = parse(&[
+            "query",
+            "a question",
+            "--provider-kind",
+            provider_kind,
+            "--endpoint",
+            "https://placeholder.openai.azure.com",
+            "--api-key",
+            "placeholder",
+            "--embedding-deployment",
+            "placeholder",
+            "--chat-deployment",
+            "placeholder",
+            "--embedding-dimensions",
+            "8",
+        ])
+        .unwrap();
+        let Commands::Query { connection, .. } = cli.command else {
+            panic!("expected the query command");
+        };
+        let kind = connection.provider_kind.clone();
+        (kind, AppConfig::try_from(connection).unwrap())
+    }
+
+    // Both commands get their provider from build_provider, and the vectors it makes have
+    // to be as long as the config says: that is the size the collection is created with.
+    #[test]
+    fn build_provider_makes_a_hash_provider_with_the_configured_dimensions() {
+        let (kind, config) = kind_and_config("hash");
+
+        let provider = build_provider(&kind, &config, DEFAULT_BATCH_SIZE);
+
+        assert!(matches!(provider, Provider::Hash(_)));
+        assert_eq!(provider.embedded_dimensions(), 8);
+    }
+
+    #[test]
+    fn build_provider_makes_an_azure_provider_with_the_configured_dimensions() {
+        let (kind, config) = kind_and_config("azure");
+
+        let provider = build_provider(&kind, &config, DEFAULT_BATCH_SIZE);
+
+        assert!(matches!(provider, Provider::Azure(_)));
+        assert_eq!(provider.embedded_dimensions(), 8);
+    }
     // ---- embedding request settings ----
 
     #[test]

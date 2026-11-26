@@ -4,4 +4,6 @@ pub mod cli;
 pub mod config;
 pub mod ingest;
 pub mod pdf;
+pub mod query;
+pub mod render;
 pub mod vector_store;
