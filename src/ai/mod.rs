@@ -1,3 +1,4 @@
+pub mod azure_chat;
 pub mod azure_provider;
 pub mod hash_provider;
 pub mod prompt;
