@@ -29,7 +29,7 @@ impl HashProvider {
 }
 
 impl EmbeddingProvider for HashProvider {
-    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, ProviderError> {
+    async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ProviderError> {
         let embedded: Vec<Vec<f32>> = texts
             .iter()
             .map(|t| HashProvider::embed_one(t, self.dimensions))
@@ -50,13 +50,9 @@ mod tests {
         HashProvider { dimensions }
     }
 
-    fn texts(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
-
     #[tokio::test]
     async fn returns_one_vector_per_text_with_the_requested_dimensions() {
-        let vectors = provider(8).embed(&texts(&["a", "b", "c"])).await.unwrap();
+        let vectors = provider(8).embed(&["a", "b", "c"]).await.unwrap();
         assert_eq!(vectors.len(), 3);
         assert!(vectors.iter().all(|v| v.len() == 8));
     }
@@ -69,15 +65,15 @@ mod tests {
     #[tokio::test]
     async fn same_text_always_gives_the_same_vector() {
         let p = provider(16);
-        let first = p.embed(&texts(&["WARNING: hot surface"])).await.unwrap();
-        let second = p.embed(&texts(&["WARNING: hot surface"])).await.unwrap();
+        let first = p.embed(&["WARNING: hot surface"]).await.unwrap();
+        let second = p.embed(&["WARNING: hot surface"]).await.unwrap();
         assert_eq!(first, second);
     }
 
     #[tokio::test]
     async fn different_texts_give_different_vectors() {
         let vectors = provider(16)
-            .embed(&texts(&["drain the boiler", "replace the gasket"]))
+            .embed(&["drain the boiler", "replace the gasket"])
             .await
             .unwrap();
         assert_ne!(vectors[0], vectors[1]);
@@ -85,7 +81,7 @@ mod tests {
 
     #[tokio::test]
     async fn vectors_are_unit_length() {
-        let vectors = provider(64).embed(&texts(&["one", "two"])).await.unwrap();
+        let vectors = provider(64).embed(&["one", "two"]).await.unwrap();
         for v in vectors {
             let magnitude = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             assert!((magnitude - 1.0).abs() < 1e-4, "magnitude was {magnitude}");
@@ -97,9 +93,9 @@ mod tests {
     #[tokio::test]
     async fn output_order_matches_input_order() {
         let p = provider(8);
-        let batch = p.embed(&texts(&["first", "second"])).await.unwrap();
-        let first_alone = p.embed(&texts(&["first"])).await.unwrap();
-        let second_alone = p.embed(&texts(&["second"])).await.unwrap();
+        let batch = p.embed(&["first", "second"]).await.unwrap();
+        let first_alone = p.embed(&["first"]).await.unwrap();
+        let second_alone = p.embed(&["second"]).await.unwrap();
         assert_eq!(batch[0], first_alone[0]);
         assert_eq!(batch[1], second_alone[0]);
     }

@@ -146,7 +146,7 @@ impl EmbeddingProvider for FailingProvider {
         SIZE as u16
     }
 
-    async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, ProviderError> {
+    async fn embed(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, ProviderError> {
         Err(ProviderError::RequestFailed("provider is down".to_string()))
     }
 }

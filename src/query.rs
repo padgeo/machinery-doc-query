@@ -14,10 +14,7 @@ pub async fn embed_question<P: EmbeddingProvider>(
         bail!("Question was empty")
     }
 
-    let mut vectors = provider
-        .embed(&[question.to_owned()])
-        .await
-        .context("Embed failed")?;
+    let mut vectors = provider.embed(&[question]).await.context("Embed failed")?;
 
     if vectors.len() != 1 {
         bail!("Embed result should have len 1, but was {}", vectors.len());
@@ -92,7 +89,7 @@ mod tests {
             self.dimensions
         }
 
-        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, ProviderError> {
+        async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ProviderError> {
             self.answer.clone().map_err(|message| {
                 ProviderError::RequestFailed(format!("{message}, asked to embed {texts:?}"))
             })
@@ -145,11 +142,7 @@ mod tests {
 
         // HashProvider gives the same text the same vector, so this is the vector of
         // the question itself.
-        let direct = provider
-            .embed(&[question.to_owned()])
-            .await
-            .unwrap()
-            .remove(0);
+        let direct = provider.embed(&[question]).await.unwrap().remove(0);
         assert_eq!(vector, direct);
     }
 

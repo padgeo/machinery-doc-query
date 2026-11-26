@@ -153,7 +153,7 @@ async fn embed_chunks<P: EmbeddingProvider>(
     provider: &P,
     chunks: &[Chunk],
 ) -> Result<Vec<Vec<f32>>> {
-    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
+    let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
     provider.embed(&texts).await.context("Embed failed")
 }
 
@@ -639,7 +639,7 @@ mod tests {
             8
         }
 
-        async fn embed(&self, _texts: &[String]) -> Result<Vec<Vec<f32>>, ProviderError> {
+        async fn embed(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, ProviderError> {
             Err(ProviderError::RequestFailed("provider is down".to_string()))
         }
     }

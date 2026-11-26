@@ -3,7 +3,7 @@ use crate::ai::{azure_provider::AzureOpenAiProvider, hash_provider::HashProvider
 pub trait EmbeddingProvider {
     fn embedded_dimensions(&self) -> u16;
     #[allow(async_fn_in_trait)]
-    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, ProviderError>;
+    async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ProviderError>;
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -23,7 +23,7 @@ pub enum Provider {
 }
 
 impl EmbeddingProvider for Provider {
-    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, ProviderError> {
+    async fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, ProviderError> {
         match self {
             Provider::Hash(hash) => hash.embed(texts).await,
             Provider::Azure(azure) => azure.embed(texts).await,
