@@ -1,22 +1,23 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, time::Duration};
 
 use crate::cli::ConnectionArgs;
 use url::Url;
 
 #[derive(custom_debug::Debug)]
 pub struct AppConfig {
-    azure_openai_endpoint: String,
-    #[allow(dead_code)] // will be used in the future
+    pub azure_openai_endpoint: String,
     #[debug(with = redacted)]
-    azure_openai_api_key: String,
-    azure_openai_api_version: String,
-    azure_openai_embedding_deployment: String,
-    azure_openai_chat_deployment: String,
+    pub azure_openai_api_key: String,
+    pub azure_openai_api_version: String,
+    pub azure_openai_embedding_deployment: String,
+    pub azure_openai_chat_deployment: String,
     pub qdrant_url: Url,
     #[debug(with = redacted)]
     pub qdrant_api_key: Option<String>,
     pub qdrant_collection: String,
     pub embedding_dimensions: u16,
+    pub request_timeout: Duration,
+    pub max_attempts: u32,
 }
 
 fn redacted<T>(_: &T, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -65,6 +66,8 @@ impl TryFrom<ConnectionArgs> for AppConfig {
             qdrant_api_key: cargs.qdrant_api_key,
             qdrant_collection: cargs.qdrant_collection,
             embedding_dimensions: cargs.embedding_dimensions,
+            request_timeout: Duration::from_secs(cargs.request_timeout_secs),
+            max_attempts: cargs.max_attempts,
         })
     }
 }
@@ -91,6 +94,8 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use crate::cli::ProviderKind::Hash;
+
     use super::*;
 
     fn valid_connection_args() -> ConnectionArgs {
@@ -104,6 +109,9 @@ mod tests {
             qdrant_api_key: None,
             qdrant_collection: "machinery_docs".to_string(),
             embedding_dimensions: 1536,
+            provider_kind: Hash,
+            request_timeout_secs: 120,
+            max_attempts: 5,
         }
     }
 
@@ -126,6 +134,22 @@ mod tests {
         assert_eq!(config.qdrant_api_key, None);
         assert_eq!(config.qdrant_collection, "machinery_docs");
         assert_eq!(config.embedding_dimensions, 1536);
+        assert_eq!(config.request_timeout, Duration::from_secs(120));
+        assert_eq!(config.max_attempts, 5);
+    }
+
+    #[test]
+    fn the_request_timeout_and_attempts_reach_the_config() {
+        let args = ConnectionArgs {
+            request_timeout_secs: 30,
+            max_attempts: 3,
+            ..valid_connection_args()
+        };
+
+        let config = AppConfig::try_from(args).expect("should build config");
+
+        assert_eq!(config.request_timeout, Duration::from_secs(30));
+        assert_eq!(config.max_attempts, 3);
     }
 
     #[test]

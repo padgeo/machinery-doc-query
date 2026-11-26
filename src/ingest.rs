@@ -123,20 +123,38 @@ pub async fn run<P: EmbeddingProvider>(
         return Ok(summary);
     }
 
-    let vector_size = u64::try_from(provider.embedded_dimensions()).context("Conversion error")?;
+    let vector_size = From::from(provider.embedded_dimensions());
+    let batch_size = batch_size.max(1);
+    let (first, rest) = chunks.split_at(batch_size.min(chunks.len()));
+
+    // Embed the first batch before touching the collection. Embedding can fail (bad
+    // key, outage) and ensure_collection with `recreate` deletes the old collection,
+    // so a failure has to happen here, while the old collection is still intact.
+    let first_embeddings = embed_chunks(provider, first).await?;
     store
         .ensure_collection(collection, vector_size, recreate)
         .await
         .context("Ensure collection failed")?;
-    for batch in chunks.chunks(batch_size.max(1)) {
-        let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
-        let embeddings = provider.embed(&texts).await.context("Embed failed")?;
+    store
+        .upsert_chunks(collection, first, &first_embeddings)
+        .await
+        .context("Upsert chunks failed")?;
+    for batch in rest.chunks(batch_size) {
+        let embeddings = embed_chunks(provider, batch).await?;
         store
             .upsert_chunks(collection, batch, &embeddings)
             .await
             .context("Upsert chunks failed")?;
     }
     Ok(summary)
+}
+
+async fn embed_chunks<P: EmbeddingProvider>(
+    provider: &P,
+    chunks: &[Chunk],
+) -> Result<Vec<Vec<f32>>> {
+    let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+    provider.embed(&texts).await.context("Embed failed")
 }
 
 fn collect_pdfs(input_dir: &PathBuf) -> Result<Vec<PathBuf>, IngestError> {
@@ -247,7 +265,7 @@ fn chunk_all_pages(all_pages: Vec<ExtractResultOk>, options: &ChunkOptions) -> V
 mod tests {
     use super::*;
     use crate::{
-        ai::hash_provider::HashProvider,
+        ai::{hash_provider::HashProvider, provider::ProviderError},
         pdf::gen_fixture_pdfs::{BOILER, NO_TEXT, PUMP, TestPdfs},
     };
     use rstest::{fixture, rstest};
@@ -611,5 +629,50 @@ mod tests {
         assert!(summary.failed.is_empty());
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].1.len(), 3);
+    }
+
+    // A provider that is down: every embed call fails.
+    struct FailingProvider;
+
+    impl EmbeddingProvider for FailingProvider {
+        fn embedded_dimensions(&self) -> u16 {
+            8
+        }
+
+        async fn embed(&self, _texts: &[&str]) -> Result<Vec<Vec<f32>>, ProviderError> {
+            Err(ProviderError::RequestFailed("provider is down".to_string()))
+        }
+    }
+
+    // Embedding can fail (outage, bad key) and ensure_collection with
+    // recreate = true deletes the old collection. So the embeddings must exist
+    // before Qdrant is touched. Nothing listens on port 1: had run() reached
+    // Qdrant first, the error would be "Ensure collection failed" instead.
+    #[tokio::test]
+    #[rstest]
+    async fn run_embeds_before_it_touches_the_collection(generated_test_pdfs: TestPdfs) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(generated_test_pdfs.path(BOILER), dir.path().join(BOILER)).unwrap();
+        let store = QdrantStore::connect("http://127.0.0.1:1", None).unwrap();
+
+        let err = run(
+            dir.path(),
+            &store,
+            "unused",
+            &FailingProvider,
+            10,
+            &ChunkOptions::default(),
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("Embed failed"), "got: {rendered}");
+        assert!(rendered.contains("provider is down"), "got: {rendered}");
+        assert!(
+            !rendered.contains("Ensure collection failed"),
+            "the collection was touched before embedding: {rendered}"
+        );
     }
 }

@@ -1,10 +1,23 @@
 use crate::{
-    ai::hash_provider::HashProvider, chunk::ChunkOptions, config::AppConfig, ingest,
+    ai::{
+        azure_provider::{AzureOpenAiProvider, DEFAULT_REQUEST_TIMEOUT},
+        hash_provider::HashProvider,
+        provider::Provider,
+        retry::RetryPolicy,
+    },
+    chunk::ChunkOptions,
+    config::AppConfig,
     vector_store::qdrant::QdrantStore,
 };
 use anyhow::{Context, Error, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+#[derive(ValueEnum, Clone, Debug)]
+pub enum ProviderKind {
+    Azure,
+    Hash,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "machinery-doc-query")]
@@ -77,6 +90,24 @@ pub struct ConnectionArgs {
     pub qdrant_collection: String,
     #[arg(long, env = "EMBEDDING_DIMENSIONS", default_value_t = 1536)]
     pub embedding_dimensions: u16,
+    #[arg(long, env = "EMBEDDING_PROVIDER", value_enum, default_value_t = ProviderKind::Azure)]
+    pub provider_kind: ProviderKind,
+    /// Seconds one embedding request may take before it counts as timed out (azure provider)
+    #[arg(
+        long,
+        env = "EMBEDDING_REQUEST_TIMEOUT_SECS",
+        default_value_t = DEFAULT_REQUEST_TIMEOUT.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub request_timeout_secs: u64,
+    /// How many times a timed out or dropped embedding request is tried (azure provider)
+    #[arg(
+        long,
+        env = "EMBEDDING_MAX_ATTEMPTS",
+        default_value_t = RetryPolicy::default().max_attempts,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub max_attempts: u32,
 }
 
 pub async fn open_cli() -> Result<()> {
@@ -118,21 +149,18 @@ async fn process_ingest(
     chunk_overlap: u16,
     recreate_collection: bool,
     batch_size: u16,
-    // these will be used in the future
+    // this will be used in the future
     #[allow(unused)] dry_run: bool,
     connection: ConnectionArgs,
 ) -> Result<(), Error> {
+    let provider_kind = connection.provider_kind.clone();
     let app_config = AppConfig::try_from(connection)?;
     let store = QdrantStore::connect(
         app_config.qdrant_url.as_str(),
         app_config.qdrant_api_key.as_deref(),
     )
     .context("QdrantStore error occurred")?;
-    let collection = app_config.qdrant_collection;
-    // clippy note: converting `u16` to `usize` cannot fail
-    let dimensions = usize::from(app_config.embedding_dimensions);
-    let provider = HashProvider { dimensions };
-
+    let collection = &app_config.qdrant_collection;
     // clippy note: converting `u16` to `usize` cannot fail
     let chunk_size = usize::from(chunk_size);
     let overlap = usize::from(chunk_overlap);
@@ -142,10 +170,11 @@ async fn process_ingest(
     };
     let recreate = recreate_collection;
 
-    let summary = ingest::run::<HashProvider>(
+    let provider = build_provider(&provider_kind, &app_config, batch_size);
+    let summary = crate::ingest::run::<Provider>(
         &input_dir,
         &store,
-        &collection,
+        collection,
         &provider,
         batch_size.into(),
         &chunk_options,
@@ -156,6 +185,33 @@ async fn process_ingest(
     println!("{:?}", summary);
     summary.ensure_ingested_something()?;
     Ok(())
+}
+
+fn build_provider(
+    provider_kind: &ProviderKind,
+    app_config: &AppConfig,
+    batch_size: u16,
+) -> Provider {
+    match provider_kind {
+        ProviderKind::Azure => Provider::Azure(Box::new(
+            AzureOpenAiProvider::new(
+                &app_config.azure_openai_endpoint,
+                &app_config.azure_openai_api_key,
+                &app_config.azure_openai_api_version,
+                app_config.azure_openai_embedding_deployment.clone(),
+                app_config.embedding_dimensions,
+                batch_size,
+            )
+            .with_request_timeout(app_config.request_timeout)
+            .with_retry_policy(RetryPolicy {
+                max_attempts: app_config.max_attempts,
+                ..Default::default()
+            }),
+        )),
+        ProviderKind::Hash => Provider::Hash(HashProvider {
+            dimensions: app_config.embedding_dimensions,
+        }),
+    }
 }
 
 fn process_query(question: String, top_k: u16, connection: ConnectionArgs) -> Result<()> {
@@ -177,7 +233,16 @@ fn process_doctor(connection: ConnectionArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::error::ErrorKind;
+    use crate::ai::provider::EmbeddingProvider;
+    use clap::{CommandFactory, error::ErrorKind};
+    use rstest::rstest;
+    use serde_json::json;
+    use std::time::Duration;
+    use url::Url;
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{header, method, path, query_param},
+    };
 
     // Note: the connection flags also read real environment variables
     // (QDRANT_URL etc.), so these tests only assert on non-env arguments.
@@ -292,5 +357,207 @@ mod tests {
     fn doctor_needs_no_arguments() {
         let cli = parse(&["doctor"]).unwrap();
         assert!(matches!(cli.command, Commands::Doctor { .. }));
+    }
+
+    // ---- embedding provider ----
+
+    #[test]
+    fn the_provider_defaults_to_azure() {
+        // Read the declared default instead of parsing: parsing would also pick
+        // up EMBEDDING_PROVIDER from the environment of whoever runs the tests.
+        let command = Cli::command();
+        let ingest = command.find_subcommand("ingest").unwrap();
+        let provider = ingest
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == "provider_kind")
+            .expect("the provider flag exists");
+
+        let defaults: Vec<String> = provider
+            .get_default_values()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(defaults, vec!["azure"]);
+    }
+
+    // The flag beats the environment variable, so these two do not depend on
+    // what is set where the tests run.
+    #[test]
+    fn the_provider_flag_accepts_azure() {
+        let cli = parse(&["ingest", "-i", "pdfs", "--provider-kind", "azure"]).unwrap();
+        let Commands::Ingest { connection, .. } = cli.command else {
+            panic!("expected the ingest command");
+        };
+
+        assert!(matches!(connection.provider_kind, ProviderKind::Azure));
+    }
+
+    // query has to embed the question with the same provider that ingested the
+    // documents, so every command takes the flag.
+    #[rstest]
+    #[case::ingest(&["ingest", "-i", "pdfs"])]
+    #[case::query(&["query", "a question"])]
+    #[case::doctor(&["doctor"])]
+    fn every_command_accepts_the_provider_flag(#[case] args: &[&str]) {
+        let mut args = args.to_vec();
+        args.extend(["--provider-kind", "hash"]);
+
+        let cli = parse(&args).unwrap();
+
+        let connection = match cli.command {
+            Commands::Ingest { connection, .. }
+            | Commands::Query { connection, .. }
+            | Commands::Doctor { connection } => connection,
+        };
+        assert!(matches!(connection.provider_kind, ProviderKind::Hash));
+    }
+
+    #[test]
+    fn an_unknown_provider_is_rejected_and_the_choices_are_listed() {
+        let err = parse(&["ingest", "-i", "pdfs", "--provider-kind", "ollama"]).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidValue);
+        let message = err.to_string();
+        assert!(
+            message.contains("azure") && message.contains("hash"),
+            "the error should list the valid choices, got: {message}"
+        );
+    }
+
+    // ---- embedding request settings ----
+
+    #[test]
+    fn the_request_settings_default_to_the_providers_own_defaults() {
+        // Declared defaults, not a parse: parsing would also read EMBEDDING_* variables
+        // from the environment of whoever runs the tests.
+        let command = Cli::command();
+        let ingest = command.find_subcommand("ingest").unwrap();
+        let default_of = |id: &str| -> Vec<String> {
+            ingest
+                .get_arguments()
+                .find(|arg| arg.get_id().as_str() == id)
+                .expect("the flag exists")
+                .get_default_values()
+                .iter()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        assert_eq!(
+            default_of("request_timeout_secs"),
+            vec![DEFAULT_REQUEST_TIMEOUT.as_secs().to_string()]
+        );
+        assert_eq!(
+            default_of("max_attempts"),
+            vec![RetryPolicy::default().max_attempts.to_string()]
+        );
+    }
+
+    // The flags beat the environment variables, so this does not depend on what is set
+    // where the tests run. Every command takes them: query embeds with the same provider.
+    #[rstest]
+    #[case::ingest(&["ingest", "-i", "pdfs"])]
+    #[case::query(&["query", "a question"])]
+    #[case::doctor(&["doctor"])]
+    fn every_command_accepts_the_request_settings(#[case] args: &[&str]) {
+        let mut args = args.to_vec();
+        args.extend(["--request-timeout-secs", "30", "--max-attempts", "3"]);
+
+        let cli = parse(&args).unwrap();
+
+        let connection = match cli.command {
+            Commands::Ingest { connection, .. }
+            | Commands::Query { connection, .. }
+            | Commands::Doctor { connection } => connection,
+        };
+        assert_eq!(connection.request_timeout_secs, 30);
+        assert_eq!(connection.max_attempts, 3);
+    }
+
+    // A timeout of 0 would fail every request at once, and 0 attempts means nothing.
+    #[rstest]
+    #[case::zero_timeout("--request-timeout-secs", "0")]
+    #[case::zero_attempts("--max-attempts", "0")]
+    #[case::timeout_not_a_number("--request-timeout-secs", "soon")]
+    #[case::attempts_not_a_number("--max-attempts", "many")]
+    fn an_unusable_request_setting_is_rejected(#[case] flag: &str, #[case] value: &str) {
+        let err = parse(&["ingest", "-i", "pdfs", flag, value]).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    // ---- build_provider ----
+
+    fn app_config(endpoint: &str) -> AppConfig {
+        AppConfig {
+            azure_openai_endpoint: endpoint.to_string(),
+            azure_openai_api_key: "test-key".to_string(),
+            azure_openai_api_version: "2024-08-01-preview".to_string(),
+            azure_openai_embedding_deployment: "emb-prod".to_string(),
+            azure_openai_chat_deployment: "chat-prod".to_string(),
+            qdrant_url: Url::parse("http://localhost:6334").unwrap(),
+            qdrant_api_key: None,
+            qdrant_collection: "machinery_docs".to_string(),
+            embedding_dimensions: 8,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            max_attempts: 5,
+        }
+    }
+
+    #[test]
+    fn build_provider_picks_the_provider_that_was_asked_for() {
+        let config = app_config("https://my-resource.openai.azure.com");
+
+        let hash = build_provider(&ProviderKind::Hash, &config, 10);
+        let azure = build_provider(&ProviderKind::Azure, &config, 10);
+
+        assert!(matches!(hash, Provider::Hash(_)));
+        assert!(matches!(azure, Provider::Azure(_)));
+    }
+
+    // The settings have to get from the config into the provider. A server that never
+    // answers, a 150 ms timeout and 2 attempts: exactly 2 requests, then "timed out".
+    #[tokio::test]
+    async fn build_provider_gives_the_azure_provider_the_configured_timeout_and_attempts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .mount(&server)
+            .await;
+        let config = AppConfig {
+            request_timeout: Duration::from_millis(150),
+            max_attempts: 2,
+            ..app_config(&server.uri())
+        };
+        let provider = build_provider(&ProviderKind::Azure, &config, 10);
+
+        let err = provider.embed(&["some text"]).await.unwrap_err();
+
+        assert!(err.to_string().contains("timed out"), "got: {err}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn build_provider_sends_the_configured_key_version_and_embedding_deployment() {
+        let server = MockServer::start().await;
+        let embedding = vec![0.0_f32; 8];
+        Mock::given(method("POST"))
+            .and(path("/openai/deployments/emb-prod/embeddings"))
+            .and(query_param("api-version", "2024-08-01-preview"))
+            .and(header("api-key", "test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list", "model": "text-embedding-3-small",
+                "data": [{"object": "embedding", "index": 0, "embedding": embedding}],
+                "usage": {"prompt_tokens": 1, "total_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = build_provider(&ProviderKind::Azure, &app_config(&server.uri()), 10);
+
+        let vectors = provider.embed(&["some text"]).await.unwrap();
+
+        assert_eq!(vectors.len(), 1);
     }
 }

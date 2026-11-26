@@ -6,6 +6,8 @@
 
 - **Extraction is bounded.** At most one PDF per CPU core is parsed at a time, so memory and thread count stay flat however many PDFs a directory holds. On a 24-core machine, 240 synthetic 4.5 MB PDFs took 0.8 s and 348 MB with the limit, against 1.1 s and 1.3 GB without it, and the extracted text was identical.
 - **Embedding and storing are batched.** Chunks are embedded and upserted `--batch-size` at a time (default 96), so only one batch of vectors is in memory and a failure keeps everything stored before it. Re-running `ingest` is safe: point IDs are derived from the file and chunk index, so existing points are updated in place.
+- **Embedding requests are bounded and retried.** Each request to Azure OpenAI has a 2 minute timeout (`--request-timeout-secs`, `EMBEDDING_REQUEST_TIMEOUT_SECS`). The OpenAI client already retries 429, 5xx and connection errors (3 retries with backoff, honouring `Retry-After`). The provider adds up to 5 attempts (`--max-attempts`, `EMBEDDING_MAX_ATTEMPTS`) for what the client leaves alone: timeouts and other transport errors, such as a connection dropped mid-response. Errors that a retry cannot fix (400, 401, ...) fail straight away.
+- **`--recreate-collection` survives a failing provider.** The first batch is embedded before the old collection is deleted, so a bad key or an outage leaves the old collection intact.
 - **A bad file doesn't stop the run.** Every PDF ends up as succeeded, skipped (no extractable text) or failed. The exit code is 1 only when nothing was ingested.
 
 ### Known limits
@@ -14,6 +16,7 @@
 - Re-running `ingest` embeds already-ingested files again (embeddings cost money). There is no skip-unchanged logic yet.
 - If a document gets shorter, or the chunk settings change, points from the previous run can stay in the collection. `ingest --recreate-collection` rebuilds it.
 - No OCR: PDFs without a text layer (scans) are skipped and reported.
+- `--provider-kind hash` (`EMBEDDING_PROVIDER=hash`) runs the pipeline without an Azure key, but its vectors carry no meaning, so searching a collection built with it gives meaningless results.
 
 ### Roadmap
 
