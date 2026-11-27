@@ -401,6 +401,25 @@ mod tests {
         );
     }
 
+    // The usual way for the model to decline: the flag, the reason in the summary, no steps.
+    #[test]
+    fn a_decline_with_no_steps_keeps_the_reason_the_model_gave() {
+        let answer = StructuredAnswer {
+            summary: "The passages do not cover the pump.".to_string(),
+            unable_to_answer: true,
+            steps: vec![],
+        };
+
+        let checked = check_citations(answer, &three_passages());
+
+        assert_eq!(
+            checked,
+            Answer::Unable {
+                reason: "The passages do not cover the pump.".to_string()
+            }
+        );
+    }
+
     #[rstest]
     #[case::empty("")]
     #[case::blank("  \n ")]
@@ -409,6 +428,23 @@ mod tests {
             summary: summary.to_string(),
             unable_to_answer: true,
             steps: vec![],
+        };
+
+        match check_citations(answer, &three_passages()) {
+            Answer::Unable { reason } => assert!(!reason.trim().is_empty()),
+            other => panic!("expected a decline, got {other:?}"),
+        }
+    }
+
+    // Steps listed next to a blank reason must not leave the reader with an empty message.
+    #[rstest]
+    #[case::empty("")]
+    #[case::blank("  \n ")]
+    fn a_decline_that_lists_steps_still_has_a_reason_to_show(#[case] summary: &str) {
+        let answer = StructuredAnswer {
+            summary: summary.to_string(),
+            unable_to_answer: true,
+            steps: vec![model_step("Guess.", &[], &[1])],
         };
 
         match check_citations(answer, &three_passages()) {
