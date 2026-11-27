@@ -136,7 +136,8 @@ fn input_clap_refuses_is_a_usage_error_before_anything_is_connected(#[case] args
 // The stored text is the question, so it has the vector of the chunk it came from (the
 // hash provider gives equal texts equal vectors) and that chunk comes first with a
 // score of 1. The output is a header naming the provider, and then the results with
-// nothing in between (the question is not echoed back).
+// nothing in between (the question is not echoed back). --retrieval-only keeps stderr
+// empty: without it the hash provider says on stderr that it has no model to ask.
 #[tokio::test]
 async fn query_prints_the_stored_chunk_first_under_a_header_naming_the_provider() {
     let folder = tempfile::tempdir().unwrap();
@@ -149,7 +150,7 @@ async fn query_prints_the_stored_chunk_first_under_a_header_naming_the_provider(
         .expect("a chunk has text");
 
     let assert = machinery(&folder, qdrant_url(), "cli_exact")
-        .args(["query", text.as_str()])
+        .args(["query", text.as_str(), "--retrieval-only"])
         .assert()
         .success()
         .stderr("");
@@ -164,6 +165,24 @@ async fn query_prints_the_stored_chunk_first_under_a_header_naming_the_provider(
     );
     let indented = format!("   {first_line}");
     assert_eq!(lines.next(), Some(indented.as_str()));
+}
+
+// The hash provider has no chat model. A query prints the passages on stdout as it did
+// before there was a model, and a single line on stderr says why there is no answer.
+#[tokio::test]
+async fn query_with_the_hash_provider_prints_the_passages_and_a_note_on_stderr() {
+    let folder = tempfile::tempdir().unwrap();
+    ingest_fixtures(&folder, "cli_hash_note");
+
+    let assert = machinery(&folder, qdrant_url(), "cli_hash_note")
+        .args(["query", "how do I drain the boiler?"])
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("Provider: hash\n1. "));
+
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "got {stderr:?}");
+    assert!(stderr.contains("hash"), "got {stderr:?}");
 }
 
 // --top-k reaches the search: with 3 passages stored, asking for 1 prints one.
@@ -205,7 +224,7 @@ async fn an_empty_collection_is_a_normal_answer() {
         .unwrap();
 
     machinery(&folder, qdrant_url(), "cli_empty")
-        .args(["query", "how do I drain the boiler?"])
+        .args(["query", "how do I drain the boiler?", "--retrieval-only"])
         .assert()
         .success()
         .stdout(

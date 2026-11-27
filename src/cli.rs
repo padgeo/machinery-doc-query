@@ -1,12 +1,15 @@
 use crate::{
     ai::{
+        azure_chat::{AzureChatProvider, AzureChatSettings},
         azure_provider::{AzureEmbeddingSettings, AzureOpenAiProvider},
         hash_provider::HashProvider,
-        provider::Provider,
+        provider::{ChatProvider, Provider},
     },
-    chunk::ChunkOptions,
+    chunk::{ChunkOptions, RetrievedChunk},
     config::AppConfig,
-    ingest, query, render,
+    ingest,
+    query::{answer_from_chunks, run},
+    render::{render_answer, render_chunks},
     vector_store::qdrant::QdrantStore,
 };
 use anyhow::{Context, Error, Result};
@@ -14,10 +17,15 @@ use clap::{Args, Parser, Subcommand, ValueEnum, value_parser};
 use std::{fmt::Display, path::PathBuf};
 
 const DEFAULT_BATCH_SIZE: u16 = 96;
+const HASH_CHAT_ERR_MSG: &str =
+    "Note: the hash provider has no chat model, so the passages are shown instead of an answer.";
 
 #[derive(ValueEnum, Clone, Debug)]
 pub enum ProviderKind {
+    /// Embeddings and answers from Azure OpenAI.
     Azure,
+    /// Vectors made from a hash of the text, with no model: for tests and offline use. There
+    /// is no chat model either, so a query prints the passages only.
     Hash,
 }
 
@@ -30,6 +38,8 @@ impl Display for ProviderKind {
     }
 }
 
+/// Answers questions about machinery manuals with step-by-step procedures, the warnings that
+/// belong to each step and the pages they come from.
 #[derive(Parser, Debug)]
 #[command(name = "machinery-doc-query")]
 struct Cli {
@@ -39,30 +49,46 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Read the PDF files in a folder and store their text in the vector database, ready to
+    /// be queried.
     Ingest {
+        /// Folder with the PDF files to ingest. Its subfolders are searched too.
         #[arg(short, long)]
         input_dir: PathBuf,
+        /// Largest size of a passage, in bytes of text.
         #[arg(short = 's', long, default_value_t = 1500)]
         chunk_size: u16,
+        /// How many bytes at the end of a passage are repeated at the start of the next one.
         #[arg(short = 'o', long, default_value_t = 200)]
         chunk_overlap: u16,
+        /// Delete the collection first and build it again, instead of adding to it.
         #[arg(short, long)]
         recreate_collection: bool,
+        /// How many passages are sent to the embedding provider in one request.
         #[arg(short, long, default_value_t = DEFAULT_BATCH_SIZE)]
         batch_size: u16,
+        /// Not implemented yet: meant to show what would be ingested without storing anything.
         #[arg(short, long)]
         dry_run: bool,
         #[command(flatten)]
         connection: ConnectionArgs,
     },
+    /// Answer a question from the ingested manuals: the steps, the warnings that belong to
+    /// them and the pages they come from.
     Query {
+        /// The question to answer, for example "how do I drain the boiler?".
         #[arg(value_parser = parse_question)]
         question: String,
+        /// How many passages to retrieve for the answer.
         #[arg(short, long, default_value_t = 5, value_parser = value_parser!(u16).range(1..))]
         top_k: u16,
+        /// Print the passages that were found instead of asking the model for an answer.
+        #[arg(long)]
+        retrieval_only: bool,
         #[command(flatten)]
         connection: ConnectionArgs,
     },
+    /// Show the settings the other commands would use. The keys are hidden.
     Doctor {
         #[command(flatten)]
         connection: ConnectionArgs,
@@ -81,36 +107,48 @@ fn parse_question(raw: &str) -> Result<String, String> {
 
 #[derive(Args, Debug)]
 pub struct ConnectionArgs {
+    /// Azure OpenAI endpoint, for example https://my-resource.openai.azure.com.
     #[arg(long, env = "AZURE_OPENAI_ENDPOINT")]
     pub endpoint: Option<String>,
-    #[arg(long, env = "AZURE_OPENAI_API_KEY")]
+    /// Azure OpenAI API key.
+    #[arg(long, env = "AZURE_OPENAI_API_KEY", hide_env_values = true)]
     pub api_key: Option<String>,
+    /// Azure OpenAI API version.
     #[arg(
         long,
         env = "AZURE_OPENAI_API_VERSION",
         default_value_t = String::from("2024-08-01-preview")
     )]
     pub api_version: String,
+    /// Azure OpenAI deployment that makes the embeddings.
     #[arg(long, env = "AZURE_OPENAI_EMBEDDING_DEPLOYMENT")]
     pub embedding_deployment: Option<String>,
+    /// Azure OpenAI deployment that writes the answers.
     #[arg(long, env = "AZURE_OPENAI_CHAT_DEPLOYMENT")]
     pub chat_deployment: Option<String>,
+    /// Address of the Qdrant server, on its gRPC port.
     #[arg(
         long,
         env = "QDRANT_URL",
         default_value_t = String::from("http://localhost:6334")
     )]
     pub qdrant_url: String,
-    #[arg(long, env = "QDRANT_API_KEY")]
+    /// API key of the Qdrant server, if it asks for one.
+    #[arg(long, env = "QDRANT_API_KEY", hide_env_values = true)]
     pub qdrant_api_key: Option<String>,
+    /// Qdrant collection that holds the passages.
     #[arg(
         long,
         env = "QDRANT_COLLECTION",
         default_value_t = String::from("machinery_docs")
     )]
     pub qdrant_collection: String,
+    /// Length of the vectors the embedding model makes. Use the same value to ingest and to
+    /// query, because the collection is created with it.
     #[arg(long, env = "EMBEDDING_DIMENSIONS", default_value_t = 1536)]
     pub embedding_dimensions: u16,
+    /// Which provider to use. Query with the provider that ingested the documents, because
+    /// vectors from different providers cannot be compared.
     #[arg(long, env = "EMBEDDING_PROVIDER", value_enum, default_value_t = ProviderKind::Azure)]
     pub provider_kind: ProviderKind,
 }
@@ -143,7 +181,8 @@ pub async fn open_cli() -> Result<()> {
             question,
             top_k,
             connection,
-        } => process_query(question, top_k, connection).await,
+            retrieval_only,
+        } => process_query(question, top_k, connection, retrieval_only).await,
         Commands::Doctor { connection } => process_doctor(connection),
     }
 }
@@ -188,16 +227,67 @@ async fn process_ingest(
     Ok(())
 }
 
-async fn process_query(question: String, top_k: u16, connection: ConnectionArgs) -> Result<()> {
+async fn process_query(
+    question: String,
+    top_k: u16,
+    connection: ConnectionArgs,
+    retrieval_only: bool,
+) -> Result<()> {
     let provider_kind = connection.provider_kind.clone();
     let app_config = AppConfig::try_from(connection)?;
     let store = connect_to_qdrant(&app_config).await?;
     let provider = build_provider(&provider_kind, &app_config, DEFAULT_BATCH_SIZE);
     let collection = &app_config.qdrant_collection;
-    let chunks = query::run(&question, &store, collection, &provider, top_k as u64).await?;
-    println!("Provider: {provider_kind}");
-    println!("{}", render::render_chunks(&chunks));
+    let chunks = run(&question, &store, collection, &provider, top_k as u64).await?;
+    let chat = AzureChatProvider::new(AzureChatSettings::from(&app_config));
+    let output = query_output(&question, &chunks, &provider_kind, retrieval_only, &chat).await?;
+    if let Some(note) = output.stderr {
+        eprintln!("{}", note);
+    }
+    println!("{}", output.stdout);
     Ok(())
+}
+
+/// What a query prints: the text for stdout and, when there is something to explain, a note
+/// for stderr. The note is kept off stdout so that stdout is the answer, or the passages,
+/// alone.
+#[derive(Debug, PartialEq)]
+struct QueryOutput {
+    stdout: String,
+    stderr: Option<String>,
+}
+
+/// Decides what a query prints, once its passages are retrieved.
+///
+/// The model is asked, and its answer is the output, unless it cannot be or was not asked
+/// for: the hash provider has no chat model (a note on stderr says so), and
+/// `--retrieval-only` asks for the passages. The passages are printed the way the query
+/// command did before there was a model: a header naming the provider, then the results.
+async fn query_output<C: ChatProvider>(
+    question: &str,
+    chunks: &[RetrievedChunk],
+    provider_kind: &ProviderKind,
+    retrieval_only: bool,
+    chat: &C,
+) -> Result<QueryOutput> {
+    match (retrieval_only, provider_kind) {
+        (true, _) => Ok(QueryOutput {
+            stdout: format!("Provider: {}\n{}", provider_kind, render_chunks(chunks)),
+            stderr: None,
+        }),
+        (false, ProviderKind::Azure) => {
+            let reply = answer_from_chunks(question, chunks, chat).await?;
+            let render = render_answer(&reply);
+            Ok(QueryOutput {
+                stdout: render,
+                stderr: None,
+            })
+        }
+        (false, ProviderKind::Hash) => Ok(QueryOutput {
+            stdout: format!("Provider: hash\n{}", render_chunks(chunks)),
+            stderr: Some(HASH_CHAT_ERR_MSG.to_owned()),
+        }),
+    }
 }
 
 fn process_doctor(connection: ConnectionArgs) -> Result<()> {
@@ -239,9 +329,18 @@ async fn connect_to_qdrant(app_config: &AppConfig) -> Result<QdrantStore> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::provider::EmbeddingProvider;
+    use crate::{
+        ai::{
+            prompt::Prompt,
+            provider::{EmbeddingProvider, ProviderError},
+        },
+        answer::{Answer, AnswerStep, Source},
+        chunk::Chunk,
+    };
     use clap::{CommandFactory, error::ErrorKind};
     use rstest::rstest;
+    use serde_json::{Value, json};
+    use std::sync::Mutex;
 
     // Note: the connection flags also read real environment variables
     // (QDRANT_URL etc.), so these tests only assert on non-env arguments.
@@ -529,5 +628,347 @@ mod tests {
 
         assert!(matches!(provider, Provider::Azure(_)));
         assert_eq!(provider.embedded_dimensions(), 8);
+    }
+
+    // ---- --retrieval-only ----
+
+    #[test]
+    fn query_asks_the_model_unless_retrieval_only_is_given() {
+        let cli = parse(&["query", "a question"]).unwrap();
+
+        let Commands::Query { retrieval_only, .. } = cli.command else {
+            panic!("expected the query command");
+        };
+        assert!(!retrieval_only);
+    }
+
+    #[test]
+    fn query_accepts_retrieval_only() {
+        let cli = parse(&["query", "a question", "--retrieval-only"]).unwrap();
+
+        let Commands::Query { retrieval_only, .. } = cli.command else {
+            panic!("expected the query command");
+        };
+        assert!(retrieval_only);
+    }
+
+    #[test]
+    fn retrieval_only_goes_with_the_other_query_flags() {
+        let cli = parse(&[
+            "query",
+            "--retrieval-only",
+            "a question",
+            "--top-k",
+            "3",
+            "--provider-kind",
+            "hash",
+        ])
+        .unwrap();
+
+        let Commands::Query {
+            question,
+            top_k,
+            retrieval_only,
+            connection,
+        } = cli.command
+        else {
+            panic!("expected the query command");
+        };
+        assert_eq!(question, "a question");
+        assert_eq!(top_k, 3);
+        assert!(retrieval_only);
+        assert!(matches!(connection.provider_kind, ProviderKind::Hash));
+    }
+
+    // The flag is about the model, and only query has one. ConnectionArgs is shared by all
+    // three commands, so a flag declared there would be accepted by ingest and doctor too.
+    #[rstest]
+    #[case::ingest(&["ingest", "-i", "pdfs"])]
+    #[case::doctor(&["doctor"])]
+    fn only_query_has_the_retrieval_only_flag(#[case] args: &[&str]) {
+        let mut args = args.to_vec();
+        args.push("--retrieval-only");
+
+        let err = parse(&args).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+    }
+
+    // --help is where a user learns what the flag does.
+    #[test]
+    fn the_retrieval_only_flag_is_explained_in_the_help() {
+        let command = Cli::command();
+        let query = command.find_subcommand("query").unwrap();
+        let flag = query
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == "retrieval_only")
+            .expect("query has the flag");
+
+        let help = flag.get_help().map(|help| help.to_string());
+
+        assert!(help.is_some_and(|help| !help.trim().is_empty()));
+    }
+
+    // ---- what a query prints ----
+
+    // A chat model that gives the one reply it was prepared with and counts how often it
+    // was asked. A second question gets NoAnswer.
+    struct StubChat {
+        reply: Mutex<Option<Result<String, ProviderError>>>,
+        asked: Mutex<usize>,
+    }
+
+    impl StubChat {
+        fn times_asked(&self) -> usize {
+            *self.asked.lock().unwrap()
+        }
+    }
+
+    impl ChatProvider for StubChat {
+        async fn complete(
+            &self,
+            _prompt: &Prompt,
+            _schema_name: &str,
+            _schema: &Value,
+        ) -> Result<String, ProviderError> {
+            *self.asked.lock().unwrap() += 1;
+            self.reply
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Err(ProviderError::NoAnswer))
+        }
+    }
+
+    fn replies_with(raw: &str) -> StubChat {
+        StubChat {
+            reply: Mutex::new(Some(Ok(raw.to_owned()))),
+            asked: Mutex::new(0),
+        }
+    }
+
+    fn fails_with(error: ProviderError) -> StubChat {
+        StubChat {
+            reply: Mutex::new(Some(Err(error))),
+            asked: Mutex::new(0),
+        }
+    }
+
+    // A model that must not be asked: if it is, its failure ends the test.
+    fn not_to_be_asked() -> StubChat {
+        fails_with(ProviderError::RequestFailed(
+            "the model was asked".to_string(),
+        ))
+    }
+
+    fn passage(file: &str, page: usize, text: &str) -> RetrievedChunk {
+        RetrievedChunk {
+            chunk: Chunk {
+                source_file: PathBuf::from(file),
+                page_number: page,
+                chunk_index: 0,
+                text: text.to_owned(),
+            },
+            score: 0.5,
+        }
+    }
+
+    // The reply of a model that follows the schema: one step, cited to passage 1.
+    fn one_step_reply() -> String {
+        json!({
+            "summary": "Drain the boiler.",
+            "unable_to_answer": false,
+            "steps": [{
+                "instruction": "Open the valve.",
+                "warnings": ["WARNING: hot."],
+                "source_indices": [1],
+            }],
+        })
+        .to_string()
+    }
+
+    // The answer that reply makes when passage 1 is a.pdf page 1.
+    fn one_step_answer() -> Answer {
+        Answer::Steps {
+            summary: "Drain the boiler.".to_string(),
+            steps: vec![AnswerStep {
+                instruction: "Open the valve.".to_string(),
+                warnings: vec!["WARNING: hot.".to_string()],
+                sources: vec![1],
+            }],
+            sources: vec![Source {
+                file: PathBuf::from("a.pdf"),
+                page: 1,
+            }],
+        }
+    }
+
+    // With a chat model, what is printed is the answer and nothing but the answer.
+    #[tokio::test]
+    async fn the_answer_is_what_a_query_prints_when_the_model_can_be_asked() {
+        let chunks = vec![passage("a.pdf", 1, "Open the valve.")];
+        let chat = replies_with(&one_step_reply());
+
+        let output = query_output(
+            "how do I drain the boiler?",
+            &chunks,
+            &ProviderKind::Azure,
+            false,
+            &chat,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            output,
+            QueryOutput {
+                stdout: render_answer(&one_step_answer()),
+                stderr: None,
+            }
+        );
+        assert_eq!(chat.times_asked(), 1);
+    }
+
+    // --retrieval-only prints the passages the way query did before there was a model, and
+    // the model is not asked: that would cost a request nobody wants.
+    #[tokio::test]
+    async fn retrieval_only_prints_the_passages_without_asking_the_model() {
+        let chunks = vec![passage("a.pdf", 1, "Open the valve.")];
+        let chat = not_to_be_asked();
+
+        let output = query_output("question", &chunks, &ProviderKind::Azure, true, &chat)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output,
+            QueryOutput {
+                stdout: format!("Provider: azure\n{}", render_chunks(&chunks)),
+                stderr: None,
+            }
+        );
+        assert_eq!(chat.times_asked(), 0);
+    }
+
+    // The hash provider only makes vectors, so there is no model to ask. The passages are
+    // printed as with --retrieval-only, and a line on stderr says why there is no answer.
+    // It is on stderr so that stdout stays the passages alone.
+    #[tokio::test]
+    async fn the_hash_provider_prints_the_passages_and_a_note_on_stderr() {
+        let chunks = vec![passage("a.pdf", 1, "Open the valve.")];
+        let chat = not_to_be_asked();
+
+        let output = query_output("question", &chunks, &ProviderKind::Hash, false, &chat)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output.stdout,
+            format!("Provider: hash\n{}", render_chunks(&chunks))
+        );
+        let note = output.stderr.expect("a note on stderr");
+        assert!(note.contains("hash"), "got: {note:?}");
+        assert!(
+            !note.trim().is_empty() && !note.trim().contains('\n'),
+            "got: {note:?}"
+        );
+        assert_eq!(chat.times_asked(), 0);
+    }
+
+    // Asking for the passages is explanation enough.
+    #[tokio::test]
+    async fn retrieval_only_with_the_hash_provider_needs_no_note() {
+        let chunks = vec![passage("a.pdf", 1, "Open the valve.")];
+        let chat = not_to_be_asked();
+
+        let output = query_output("question", &chunks, &ProviderKind::Hash, true, &chat)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output,
+            QueryOutput {
+                stdout: format!("Provider: hash\n{}", render_chunks(&chunks)),
+                stderr: None,
+            }
+        );
+        assert_eq!(chat.times_asked(), 0);
+    }
+
+    // Saying that it cannot answer is an answer: it is printed, and the command succeeds.
+    #[tokio::test]
+    async fn a_model_that_cannot_answer_is_printed_as_the_output() {
+        let chunks = vec![passage("a.pdf", 1, "Open the valve.")];
+        let reply = json!({
+            "summary": "The passages do not cover the pump.",
+            "unable_to_answer": true,
+            "steps": [],
+        })
+        .to_string();
+
+        let output = query_output(
+            "question",
+            &chunks,
+            &ProviderKind::Azure,
+            false,
+            &replies_with(&reply),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            output,
+            QueryOutput {
+                stdout: "Unable to answer: The passages do not cover the pump.".to_string(),
+                stderr: None,
+            }
+        );
+    }
+
+    // A failed request is the command's error, so nothing is printed on stdout and the exit
+    // code and stderr tell what happened.
+    #[tokio::test]
+    async fn a_failed_request_is_an_error_and_not_an_output() {
+        let chunks = vec![passage("a.pdf", 1, "Open the valve.")];
+        let chat = fails_with(ProviderError::Refused(
+            "I cannot help with that.".to_string(),
+        ));
+
+        let err = query_output("question", &chunks, &ProviderKind::Azure, false, &chat)
+            .await
+            .unwrap_err();
+
+        let chain = format!("{err:#}");
+        assert!(chain.contains("I cannot help with that."), "got {chain}");
+    }
+
+    // Nothing found is a normal result. With a model it says that it cannot answer, and the
+    // model is not asked about nothing.
+    #[tokio::test]
+    async fn with_no_passages_the_answer_says_it_cannot_answer_and_the_model_is_not_asked() {
+        let chat = not_to_be_asked();
+
+        let output = query_output("question", &[], &ProviderKind::Azure, false, &chat)
+            .await
+            .unwrap();
+
+        assert!(
+            output.stdout.starts_with("Unable to answer: "),
+            "got: {}",
+            output.stdout
+        );
+        assert_eq!(output.stderr, None);
+        assert_eq!(chat.times_asked(), 0);
+    }
+
+    #[tokio::test]
+    async fn with_no_passages_the_passages_output_is_the_usual_sentence() {
+        let chat = not_to_be_asked();
+
+        let output = query_output("question", &[], &ProviderKind::Hash, true, &chat)
+            .await
+            .unwrap();
+
+        assert_eq!(output.stdout, "Provider: hash\nNo matching passages found.");
     }
 }
