@@ -37,8 +37,9 @@ pub enum Answer {
 const FALLBACK_REASON: &str = "No reason given.";
 const NO_STEPS_REASON: &str = "No steps given.";
 
-/// Checkes and groups the citations for the answer
-/// Filters out duplicate citations and duplicate passages/warnings
+/// Checks and groups the citations for the answer.
+/// Filters out duplicate citations and dedups source numbers per step and the pages in the source list.
+/// Source numbers pointing nowhere are dropped.
 /// Returns Unable answer if the AI returned that it was unable to answer
 /// or no steps were given in the answer.
 pub fn check_citations(answer: StructuredAnswer, passages: &[RetrievedChunk]) -> Answer {
@@ -58,10 +59,9 @@ pub fn check_citations(answer: StructuredAnswer, passages: &[RetrievedChunk]) ->
         };
     }
 
-    let mut sources: Vec<Source> = Vec::new(); // outside the loop: shared by all steps
+    let mut sources: Vec<Source> = Vec::new();
     let mut steps = Vec::new();
     for step in answer.steps {
-        // owned, so no clones of text/warnings
         let mut labels = Vec::new();
         for number in step.source_indices {
             let Some(passage) = passage_for(number, passages) else {
