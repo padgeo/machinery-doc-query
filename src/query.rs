@@ -1,10 +1,17 @@
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
-    ai::provider::EmbeddingProvider,
+    ai::{
+        prompt::build_prompt,
+        provider::{ChatProvider, EmbeddingProvider},
+        schema::{SCHEMA_NAME, answer_schema, parse_answer},
+    },
+    answer::{Answer, check_citations},
     chunk::RetrievedChunk,
     vector_store::qdrant::{QdrantStore, QdrantStoreError},
 };
+
+const NO_PASSAGES_RESPONSE: &str = "No passages were found to answer from.";
 
 pub async fn embed_question<P: EmbeddingProvider>(
     provider: &P,
@@ -57,6 +64,34 @@ pub async fn run<P: EmbeddingProvider>(
         .with_context(|| format!("Failed to search collection {}", collection))
 }
 
+/// Asks the model for a procedure that answers `question` from `chunks`, then checks the
+/// citations in its reply against those same chunks.
+///
+/// A model that says it cannot answer gives `Answer::Unable`, which is not an error. An
+/// error is a request that failed (it was refused, cut off, filtered, got no answer or
+/// could not be sent) or a reply that does not match the schema, and that error shows how
+/// the reply starts. With no chunks there is nothing to answer from, so the model is not
+/// asked at all.
+pub async fn answer_from_chunks<C: ChatProvider>(
+    question: &str,
+    chunks: &[RetrievedChunk],
+    chat: &C,
+) -> Result<Answer> {
+    if chunks.is_empty() {
+        return Ok(Answer::Unable {
+            reason: NO_PASSAGES_RESPONSE.to_owned(),
+        });
+    }
+
+    let prompt = build_prompt(question, chunks);
+    let reply_string = chat
+        .complete(&prompt, SCHEMA_NAME, &answer_schema())
+        .await
+        .context("Chat error")?;
+    let parsed_reply = parse_answer(&reply_string)?;
+    Ok(check_citations(parsed_reply, chunks))
+}
+
 fn explain_collection_error(err: QdrantStoreError, collection: &str) -> anyhow::Error {
     match err {
         QdrantStoreError::CollectionDoesntExist(_) => {
@@ -74,10 +109,22 @@ fn explain_collection_error(err: QdrantStoreError, collection: &str) -> anyhow::
 
 #[cfg(test)]
 mod tests {
+    use std::{path::PathBuf, sync::Mutex};
+
     use rstest::rstest;
+    use serde_json::{Value, json};
 
     use super::*;
-    use crate::ai::{hash_provider::HashProvider, provider::ProviderError};
+    use crate::{
+        ai::{
+            hash_provider::HashProvider,
+            prompt::{Prompt, build_prompt},
+            provider::ProviderError,
+            schema::{SCHEMA_NAME, answer_schema},
+        },
+        answer::{AnswerStep, Source},
+        chunk::Chunk,
+    };
 
     // A provider that always gives the same answer, so each test decides what comes
     // back: vectors, or the message of a request that failed. A failed request also
@@ -318,5 +365,320 @@ mod tests {
         let chain = format!("{err:#}");
         assert!(chain.contains("boiler_docs"), "got {chain}");
         assert!(chain.contains("the cause"), "got {chain}");
+    }
+
+    // ---- answer_from_chunks ----
+
+    // What a chat model was asked: the prompt and the schema that came with it.
+    struct Asked {
+        prompt: Prompt,
+        schema_name: String,
+        schema: Value,
+    }
+
+    // A chat model that gives the one reply it was prepared with and remembers each time it
+    // was asked. A second question gets NoAnswer, so a request that should not happen shows.
+    struct StubChat {
+        reply: Mutex<Option<Result<String, ProviderError>>>,
+        asked: Mutex<Vec<Asked>>,
+    }
+
+    impl ChatProvider for StubChat {
+        async fn complete(
+            &self,
+            prompt: &Prompt,
+            schema_name: &str,
+            schema: &Value,
+        ) -> Result<String, ProviderError> {
+            self.asked.lock().unwrap().push(Asked {
+                prompt: prompt.clone(),
+                schema_name: schema_name.to_owned(),
+                schema: schema.clone(),
+            });
+            self.reply
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(Err(ProviderError::NoAnswer))
+        }
+    }
+
+    fn replies_with(raw: &str) -> StubChat {
+        StubChat {
+            reply: Mutex::new(Some(Ok(raw.to_owned()))),
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn fails_with(error: ProviderError) -> StubChat {
+        StubChat {
+            reply: Mutex::new(Some(Err(error))),
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn passage(file: &str, page: usize, text: &str) -> RetrievedChunk {
+        RetrievedChunk {
+            chunk: Chunk {
+                source_file: PathBuf::from(file),
+                page_number: page,
+                chunk_index: 0,
+                text: text.to_owned(),
+            },
+            score: 0.5,
+        }
+    }
+
+    // Passage 1 is a.pdf page 1, passage 2 is b.pdf page 2, passage 3 is c.pdf page 3.
+    fn three_passages() -> Vec<RetrievedChunk> {
+        vec![
+            passage("a.pdf", 1, "Open the valve."),
+            passage("b.pdf", 2, "Wear gloves."),
+            passage("c.pdf", 3, "Close the valve."),
+        ]
+    }
+
+    fn source(file: &str, page: usize) -> Source {
+        Source {
+            file: PathBuf::from(file),
+            page,
+        }
+    }
+
+    fn step(instruction: &str, warnings: &[&str], source_indices: &[i64]) -> Value {
+        json!({
+            "instruction": instruction,
+            "warnings": warnings,
+            "source_indices": source_indices,
+        })
+    }
+
+    // The reply of a model that follows the schema and gives these steps.
+    fn procedure(steps: Value) -> String {
+        json!({
+            "summary": "Drain the boiler.",
+            "unable_to_answer": false,
+            "steps": steps,
+        })
+        .to_string()
+    }
+
+    // The model is sent what was retrieved, in the order its numbers count from, with the
+    // schema it has to follow. One question is one request.
+    #[tokio::test]
+    async fn the_model_is_asked_once_with_the_prompt_and_the_schema() {
+        let chunks = three_passages();
+        let chat = replies_with(&procedure(json!([step("Do it.", &[], &[1])])));
+
+        answer_from_chunks("how do I drain the boiler?", &chunks, &chat)
+            .await
+            .unwrap();
+
+        let asked = chat.asked.lock().unwrap();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            asked[0].prompt,
+            build_prompt("how do I drain the boiler?", &chunks)
+        );
+        assert_eq!(asked[0].schema_name, SCHEMA_NAME);
+        assert_eq!(asked[0].schema, answer_schema());
+    }
+
+    // The numbers in the answer count the passages in the prompt, so the sources have to be
+    // the files and pages of those passages. Here the model cites passage 2, then 3 and 1.
+    #[tokio::test]
+    async fn the_sources_of_a_procedure_are_the_chunks_that_were_sent() {
+        let chunks = three_passages();
+        let reply = procedure(json!([
+            step("Open the valve.", &["WARNING: hot."], &[2]),
+            step("Close it.", &[], &[3, 1]),
+        ]));
+
+        let answer = answer_from_chunks("question", &chunks, &replies_with(&reply))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            answer,
+            Answer::Steps {
+                summary: "Drain the boiler.".to_string(),
+                steps: vec![
+                    AnswerStep {
+                        instruction: "Open the valve.".to_string(),
+                        warnings: vec!["WARNING: hot.".to_string()],
+                        sources: vec![1],
+                    },
+                    AnswerStep {
+                        instruction: "Close it.".to_string(),
+                        warnings: vec![],
+                        sources: vec![2, 3],
+                    },
+                ],
+                sources: vec![source("b.pdf", 2), source("c.pdf", 3), source("a.pdf", 1)],
+            }
+        );
+    }
+
+    // A number that points at no passage is the model's mistake. It is dropped, and its step
+    // stays without a source: the answer is not turned into an error.
+    #[tokio::test]
+    async fn a_number_the_model_made_up_is_dropped_without_failing_the_answer() {
+        let chunks = three_passages();
+        let reply = procedure(json!([
+            step("Open the valve.", &[], &[1, 9]),
+            step("Close it.", &[], &[9]),
+        ]));
+
+        let answer = answer_from_chunks("question", &chunks, &replies_with(&reply))
+            .await
+            .unwrap();
+
+        match answer {
+            Answer::Steps { steps, sources, .. } => {
+                assert_eq!(sources, vec![source("a.pdf", 1)]);
+                assert_eq!(steps[0].sources, vec![1]);
+                assert!(steps[1].sources.is_empty());
+            }
+            other => panic!("expected a procedure, got {other:?}"),
+        }
+    }
+
+    // Saying that it cannot answer is an answer, not a failure: the reader is told why.
+    #[tokio::test]
+    async fn a_model_that_cannot_answer_gives_an_unable_answer_and_not_an_error() {
+        let reply = json!({
+            "summary": "The passages do not cover the pump.",
+            "unable_to_answer": true,
+            "steps": [],
+        })
+        .to_string();
+
+        let answer = answer_from_chunks("question", &three_passages(), &replies_with(&reply))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            answer,
+            Answer::Unable {
+                reason: "The passages do not cover the pump.".to_string()
+            }
+        );
+    }
+
+    // No steps and no word about it is still no procedure. What the model wrote instead is
+    // prose that nothing was cited for, so it is not shown as the reason.
+    #[tokio::test]
+    async fn a_reply_with_no_steps_is_an_unable_answer_too() {
+        let reply = json!({
+            "summary": "Just open the valve.",
+            "unable_to_answer": false,
+            "steps": [],
+        })
+        .to_string();
+
+        let answer = answer_from_chunks("question", &three_passages(), &replies_with(&reply))
+            .await
+            .unwrap();
+
+        match answer {
+            Answer::Unable { reason } => {
+                assert!(!reason.trim().is_empty());
+                assert!(!reason.contains("open the valve"), "got: {reason}");
+            }
+            other => panic!("expected an unable answer, got {other:?}"),
+        }
+    }
+
+    // Every way a request can fail is an error that keeps the provider's own words. A
+    // refusal is not an "unable", and a cut-off answer must not be read as a short one.
+    // The request is not repeated here: the provider already retries what is worth it.
+    #[rstest]
+    #[case::refused(ProviderError::Refused("I cannot help with that.".to_string()))]
+    #[case::cut_off(ProviderError::Truncated)]
+    #[case::filtered(ProviderError::Filtered("violence".to_string()))]
+    #[case::no_answer(ProviderError::NoAnswer)]
+    #[case::request_failed(ProviderError::RequestFailed("connection reset".to_string()))]
+    #[tokio::test]
+    async fn a_failed_request_is_an_error_that_keeps_the_providers_message(
+        #[case] error: ProviderError,
+    ) {
+        let expected = error.to_string();
+        let chat = fails_with(error);
+
+        let err = answer_from_chunks("question", &three_passages(), &chat)
+            .await
+            .unwrap_err();
+
+        let chain = format!("{err:#}");
+        assert!(chain.contains(&expected), "got {chain}");
+        assert_eq!(chat.asked.lock().unwrap().len(), 1);
+    }
+
+    // A reply that is not what the schema asks for is an error, not an unable answer, and
+    // the error shows how the reply starts, so that it can be seen what the model wrote.
+    #[rstest]
+    #[case::not_json("I'm sorry, but I cannot help with that.")]
+    #[case::wrong_type(r#"{"summary": 5, "unable_to_answer": false, "steps": []}"#)]
+    #[case::missing_field(r#"{"summary": "Drain it.", "steps": []}"#)]
+    #[case::unknown_field(
+        r#"{"summary": "x", "unable_to_answer": false, "steps": [], "extra": 1}"#
+    )]
+    #[case::cut_off(r#"{"summary": "Drain the boi"#)]
+    #[tokio::test]
+    async fn a_reply_that_does_not_match_the_schema_is_an_error_that_shows_its_start(
+        #[case] raw: &str,
+    ) {
+        let err = answer_from_chunks("question", &three_passages(), &replies_with(raw))
+            .await
+            .unwrap_err();
+
+        let chain = format!("{err:#}");
+        let start: String = raw.chars().take(12).collect();
+        assert!(chain.contains(&start), "got {chain}");
+    }
+
+    // The reply can be pages long, and only the start of it is quoted.
+    #[tokio::test]
+    async fn a_long_malformed_reply_is_cut_in_the_error() {
+        let raw = format!("Sorry. {}", "blah ".repeat(2_000));
+
+        let err = answer_from_chunks("question", &three_passages(), &replies_with(&raw))
+            .await
+            .unwrap_err();
+
+        let chain = format!("{err:#}");
+        assert!(chain.contains("Sorry."), "got {chain}");
+        assert!(chain.len() < 1_000, "{} characters: {chain}", chain.len());
+    }
+
+    // With nothing retrieved there is nothing to answer from. Asking anyway would cost a
+    // request and invite an answer from general knowledge, so the model is not asked.
+    #[tokio::test]
+    async fn with_no_chunks_the_model_is_not_asked() {
+        let chat = replies_with(&procedure(json!([step("Do it.", &[], &[1])])));
+
+        let answer = answer_from_chunks("question", &[], &chat).await.unwrap();
+
+        assert!(chat.asked.lock().unwrap().is_empty());
+        match answer {
+            Answer::Unable { reason } => assert!(!reason.trim().is_empty()),
+            other => panic!("expected an unable answer, got {other:?}"),
+        }
+    }
+
+    // One passage is enough to answer from: only an empty list means there is nothing.
+    #[tokio::test]
+    async fn a_single_chunk_is_enough_to_ask_the_model() {
+        let chunks = vec![passage("a.pdf", 1, "Open the valve.")];
+        let reply = procedure(json!([step("Open the valve.", &[], &[1])]));
+
+        let answer = answer_from_chunks("question", &chunks, &replies_with(&reply))
+            .await
+            .unwrap();
+
+        match answer {
+            Answer::Steps { sources, .. } => assert_eq!(sources, vec![source("a.pdf", 1)]),
+            other => panic!("expected a procedure, got {other:?}"),
+        }
     }
 }
