@@ -204,6 +204,33 @@ async fn a_stored_chunk(collection: &str) -> StoredChunk {
     }
 }
 
+// A chunk of the collection that has `needle` in its text, read straight from Qdrant.
+async fn a_stored_chunk_with(collection: &str, needle: &str) -> StoredChunk {
+    let response = client()
+        .scroll(
+            ScrollPointsBuilder::new(collection)
+                .limit(10)
+                .with_payload(true),
+        )
+        .await
+        .expect("scroll the collection");
+    response
+        .result
+        .iter()
+        .find_map(|point| {
+            let text = point.payload.get(TEXT_KEY)?.as_str()?;
+            if !text.contains(needle) {
+                return None;
+            }
+            Some(StoredChunk {
+                file: point.payload.get(SOURCE_KEY)?.as_str()?.to_string(),
+                page: point.payload.get(PAGE_KEY)?.as_integer()?,
+                text: text.to_string(),
+            })
+        })
+        .expect("a stored chunk with that text")
+}
+
 // What the model says in the tests that need a procedure. Passage 1 is the chunk the question
 // is the text of, because it has the same vector and so comes first.
 fn drain_answer() -> Value {
@@ -312,6 +339,44 @@ async fn a_model_that_cannot_answer_exits_0_with_the_reason() {
         .assert()
         .success()
         .stdout("Unable to answer: The passages do not cover the pump.\n")
+        .stderr("");
+}
+
+// ---- a warning the model left out ----
+
+// The model is asked to copy the warnings of the passages it cites, and one it leaves out is the
+// biggest risk of all. This model forgets: its only step cites the passage with the CAUTION line
+// and carries no warning. The line of the manual is shown under the step all the same.
+#[tokio::test]
+async fn a_warning_the_model_left_out_is_shown_under_the_step_that_cites_its_passage() {
+    let folder = tempfile::tempdir().unwrap();
+    let forgetful = json!({
+        "summary": "Clean the sensor.",
+        "unable_to_answer": false,
+        "steps": [{
+            "instruction": "Wipe the sensor housing.",
+            "warnings": [],
+            "source_indices": [1],
+        }],
+    });
+    let azure = azure(model_says(&forgetful), 1).await;
+    ingest_fixtures(&folder, &azure, "answer_backstop");
+    let cautious = a_stored_chunk_with("answer_backstop", "CAUTION:").await;
+    let caution = cautious
+        .text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("CAUTION:"))
+        .expect("a CAUTION line")
+        .to_string();
+
+    machinery(&folder, &azure, "answer_backstop")
+        .args(["query", cautious.text.as_str()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "1. Wipe the sensor housing. [1]\n   {caution}"
+        )))
         .stderr("");
 }
 

@@ -8,3 +8,4 @@ pub mod pdf;
 pub mod query;
 pub mod render;
 pub mod vector_store;
+pub mod warnings;

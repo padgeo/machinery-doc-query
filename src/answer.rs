@@ -1,6 +1,10 @@
 use std::path::PathBuf;
 
-use crate::{ai::schema::StructuredAnswer, chunk::RetrievedChunk};
+use crate::{
+    ai::schema::StructuredAnswer,
+    chunk::RetrievedChunk,
+    warnings::{carries, find_warnings},
+};
 
 /// A page of a document that an answer cites.
 #[derive(Debug, Clone, PartialEq)]
@@ -61,15 +65,20 @@ pub fn check_citations(answer: StructuredAnswer, passages: &[RetrievedChunk]) ->
 
     let mut sources: Vec<Source> = Vec::new();
     let mut steps = Vec::new();
+    // For each step, the passages it cites (by position, each once), in the order of `steps`.
+    let mut cited = Vec::new();
+
     for step in answer.steps {
         let mut labels = Vec::new();
+        let mut positions = Vec::new();
         for number in step.source_indices {
             let Some(passage) = passage_for(number, passages) else {
                 continue;
             };
+            let passage_chunk = &passages[passage];
             let source = Source {
-                file: passage.chunk.source_file.clone(),
-                page: passage.chunk.page_number,
+                file: passage_chunk.chunk.source_file.clone(),
+                page: passage_chunk.chunk.page_number,
             };
             let label = match sources.iter().position(|known| *known == source) {
                 Some(position) => position + 1,
@@ -79,15 +88,22 @@ pub fn check_citations(answer: StructuredAnswer, passages: &[RetrievedChunk]) ->
                 }
             };
             labels.push(label);
+            // Several numbers can lead to the same passage. It counts once.
+            if !positions.contains(&passage) {
+                positions.push(passage);
+            }
         }
         labels.sort_unstable();
         labels.dedup();
+        cited.push(positions);
         steps.push(AnswerStep {
             instruction: step.instruction,
             warnings: step.warnings,
             sources: labels,
         });
     }
+    // The citations are settled, so the warnings of the cited passages can be checked.
+    add_missing_warnings(&mut steps, &cited, passages);
     Answer::Steps {
         summary: answer.summary,
         steps,
@@ -95,10 +111,51 @@ pub fn check_citations(answer: StructuredAnswer, passages: &[RetrievedChunk]) ->
     }
 }
 
-fn passage_for(number: i64, passages: &[RetrievedChunk]) -> Option<&RetrievedChunk> {
+fn passage_for(number: i64, passages: &[RetrievedChunk]) -> Option<usize> {
     let number = usize::try_from(number).ok()?; // negative -> None
     let position = number.checked_sub(1)?; // 0 -> None
-    passages.get(position) // too big -> None
+    (position < passages.len()).then_some(position) // too big -> None
+}
+
+/// Every warning of a cited passage has to be under a step that cites the passage. When none
+/// of those steps carries it, it goes to the first of them.
+fn add_missing_warnings(
+    steps: &mut [AnswerStep],
+    cited: &[Vec<usize>],
+    passages: &[RetrievedChunk],
+) {
+    // The passages that are cited, each once, in the order they are first cited. That is the
+    // order of the sources, and it decides the order the added warnings come out in.
+    let mut in_order_of_citation: Vec<usize> = Vec::new();
+    for &position in cited.iter().flatten() {
+        if !in_order_of_citation.contains(&position) {
+            in_order_of_citation.push(position);
+        }
+    }
+
+    for position in in_order_of_citation {
+        // The steps that cite this passage, as indexes into `steps`. Only they can carry its
+        // warnings, and the first of them gets the ones that are missing. The list is never
+        // empty: the passage is here because some step cites it.
+        let citing: Vec<usize> = (0..steps.len())
+            .filter(|&step| cited[step].contains(&position))
+            .collect();
+        for found in find_warnings(&passages[position].chunk.text) {
+            // Does one of those steps already carry this warning? The warnings are read as they
+            // are now, so one that was just added counts, and a warning that stands in two
+            // overlapping passages is added once. Indexes and not references keep the borrow
+            // checker quiet: this read is over before the `push` below changes `steps`.
+            let carried = citing.iter().any(|&step| {
+                steps[step]
+                    .warnings
+                    .iter()
+                    .any(|warning| carries(warning, &found))
+            });
+            if !carried {
+                steps[citing[0]].warnings.push(found);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -469,6 +526,246 @@ mod tests {
                 assert!(!reason.contains("open the valve"), "got: {reason}");
             }
             other => panic!("expected a decline, got {other:?}"),
+        }
+    }
+
+    // ---- warnings the model left out ----
+
+    // A passage with a text of its own.
+    fn passage_with(file: &str, page: usize, text: &str) -> RetrievedChunk {
+        let mut passage = passage(file, page);
+        passage.chunk.text = text.to_string();
+        passage
+    }
+
+    // The model is asked to copy every warning of the passages it cites into its steps. When it
+    // forgets one, the warning of the manual is added to the step that cites the passage, so
+    // that it cannot get lost.
+    #[test]
+    fn a_warning_the_model_left_out_is_added_to_the_step_that_cites_its_passage() {
+        let passages = [passage_with(
+            "a.pdf",
+            1,
+            "1. Open the valve.\nWARNING: Scalding water.",
+        )];
+        let steps = vec![model_step("Open the valve.", &[], &[1])];
+
+        let (steps, _) = checked(steps, &passages);
+
+        assert_eq!(steps[0].warnings, vec!["WARNING: Scalding water."]);
+    }
+
+    #[test]
+    fn a_warning_the_step_carries_is_not_added_again() {
+        let passages = [passage_with("a.pdf", 1, "WARNING: Scalding water.")];
+        let steps = vec![model_step(
+            "Open the valve.",
+            &["WARNING: Scalding water."],
+            &[1],
+        )];
+
+        let (steps, _) = checked(steps, &passages);
+
+        assert_eq!(steps[0].warnings, vec!["WARNING: Scalding water."]);
+    }
+
+    // A copy that differs only in case, in spacing or in the last full stop is still the same
+    // warning, and the step keeps it as it is.
+    #[rstest]
+    #[case::another_case("warning: SCALDING water.")]
+    #[case::other_spacing("WARNING:   Scalding\nwater.")]
+    #[case::without_the_last_full_stop("WARNING: Scalding water")]
+    #[case::with_more_text("WARNING: Scalding water. Wear gloves.")]
+    fn a_copy_that_differs_a_little_is_still_a_copy(#[case] warning: &str) {
+        let passages = [passage_with("a.pdf", 1, "WARNING: Scalding water.")];
+        let steps = vec![model_step("Open the valve.", &[warning], &[1])];
+
+        let (steps, _) = checked(steps, &passages);
+
+        assert_eq!(steps[0].warnings, vec![warning]);
+    }
+
+    // A paraphrase is not the wording of the manual, which is what the model was asked for. Both
+    // stay: what the model wrote, and then the warning of the manual.
+    #[test]
+    fn a_paraphrase_does_not_count_so_the_warning_of_the_manual_is_added_after_it() {
+        let passages = [passage_with("a.pdf", 1, "WARNING: Scalding water.")];
+        let steps = vec![model_step(
+            "Open the valve.",
+            &["Be careful with the hot water."],
+            &[1],
+        )];
+
+        let (steps, _) = checked(steps, &passages);
+
+        assert_eq!(
+            steps[0].warnings,
+            vec!["Be careful with the hot water.", "WARNING: Scalding water."]
+        );
+    }
+
+    // Only the passages that steps cite are looked at. The model left the others aside.
+    #[test]
+    fn a_passage_no_step_cites_is_not_looked_at() {
+        let passages = [
+            passage_with("a.pdf", 1, "Open the valve."),
+            passage_with("b.pdf", 2, "WARNING: Hot pipe."),
+        ];
+        let steps = vec![model_step("Open the valve.", &[], &[1])];
+
+        let (steps, _) = checked(steps, &passages);
+
+        assert!(steps[0].warnings.is_empty());
+    }
+
+    #[test]
+    fn the_warning_goes_to_the_first_step_that_cites_the_passage() {
+        let passages = [passage_with("a.pdf", 1, "WARNING: Hot.")];
+        let steps = vec![model_step("One.", &[], &[1]), model_step("Two.", &[], &[1])];
+
+        let (steps, _) = checked(steps, &passages);
+
+        assert_eq!(steps[0].warnings, vec!["WARNING: Hot."]);
+        assert!(steps[1].warnings.is_empty());
+    }
+
+    // One of the steps that cite the passage carries it, and that is enough.
+    #[test]
+    fn a_warning_that_any_step_citing_the_passage_carries_is_not_added_to_the_others() {
+        let passages = [passage_with("a.pdf", 1, "WARNING: Hot.")];
+        let steps = vec![
+            model_step("One.", &[], &[1]),
+            model_step("Two.", &["WARNING: Hot."], &[1]),
+        ];
+
+        let (steps, _) = checked(steps, &passages);
+
+        assert!(steps[0].warnings.is_empty());
+        assert_eq!(steps[1].warnings, vec!["WARNING: Hot."]);
+    }
+
+    // The step that carries the warning has to be one that cites the passage it is from: a copy
+    // under a step that cites another passage cannot be traced to its page.
+    #[test]
+    fn a_step_that_does_not_cite_the_passage_does_not_count_as_carrying_its_warning() {
+        let passages = [
+            passage_with("a.pdf", 1, "WARNING: Hot."),
+            passage_with("b.pdf", 2, "Close the valve."),
+        ];
+        let steps = vec![
+            model_step("One.", &[], &[1]),
+            model_step("Two.", &["WARNING: Hot."], &[2]),
+        ];
+
+        let (steps, _) = checked(steps, &passages);
+
+        assert_eq!(steps[0].warnings, vec!["WARNING: Hot."]);
+        assert_eq!(steps[1].warnings, vec!["WARNING: Hot."]);
+    }
+
+    #[test]
+    fn added_warnings_follow_the_ones_the_model_gave_in_the_order_of_the_passage() {
+        let passages = [passage_with(
+            "a.pdf",
+            1,
+            "WARNING: One.\n1. Open the valve.\nCAUTION: Two.",
+        )];
+        let steps = vec![model_step("Open the valve.", &["DANGER: Its own."], &[1])];
+
+        let (steps, _) = checked(steps, &passages);
+
+        assert_eq!(
+            steps[0].warnings,
+            vec!["DANGER: Its own.", "WARNING: One.", "CAUTION: Two."]
+        );
+    }
+
+    // The passages are taken in the order they are first cited, the order of the sources.
+    #[test]
+    fn the_warnings_of_several_passages_are_added_in_the_order_the_passages_are_first_cited() {
+        let passages = [
+            passage_with("a.pdf", 1, "WARNING: One."),
+            passage_with("b.pdf", 2, "WARNING: Two."),
+        ];
+        let steps = vec![model_step("Do it.", &[], &[2, 1])];
+
+        let (steps, _) = checked(steps, &passages);
+
+        assert_eq!(steps[0].warnings, vec!["WARNING: Two.", "WARNING: One."]);
+    }
+
+    // The text of neighbouring passages overlaps, so one warning can stand in both of them.
+    #[test]
+    fn a_warning_in_two_cited_passages_is_added_once() {
+        let passages = [
+            passage_with("a.pdf", 1, "1. Open the valve.\nWARNING: Hot."),
+            passage_with("a.pdf", 1, "WARNING: Hot.\n2. Close it."),
+        ];
+        let steps = vec![model_step("Do it.", &[], &[1, 2])];
+
+        let (steps, _) = checked(steps, &passages);
+
+        assert_eq!(steps[0].warnings, vec!["WARNING: Hot."]);
+    }
+
+    // A step with no valid source cites nothing, so no passage is its own.
+    #[test]
+    fn a_step_without_a_valid_source_gets_no_warning() {
+        let passages = [passage_with("a.pdf", 1, "WARNING: Hot.")];
+        let steps = vec![
+            model_step("One.", &[], &[0, 9]),
+            model_step("Two.", &[], &[1]),
+        ];
+
+        let (steps, _) = checked(steps, &passages);
+
+        assert!(steps[0].warnings.is_empty());
+        assert_eq!(steps[1].warnings, vec!["WARNING: Hot."]);
+    }
+
+    // A warning of two lines is one warning, shown as one line.
+    #[test]
+    fn a_warning_over_several_lines_is_added_as_one_line() {
+        let passages = [passage_with(
+            "a.pdf",
+            1,
+            "WARNING: Disconnect the power\nbefore removing the cover.",
+        )];
+        let steps = vec![model_step("Remove the cover.", &[], &[1])];
+
+        let (steps, _) = checked(steps, &passages);
+
+        assert_eq!(
+            steps[0].warnings,
+            vec!["WARNING: Disconnect the power before removing the cover."]
+        );
+    }
+
+    // The sources, and the numbers that point at them, are the same with and without the warning.
+    #[test]
+    fn adding_a_warning_changes_neither_the_sources_nor_their_numbers() {
+        let with_warning = [
+            passage_with("a.pdf", 1, "WARNING: Hot."),
+            passage_with("b.pdf", 2, "Close it."),
+        ];
+        let without = [
+            passage_with("a.pdf", 1, "Open it."),
+            passage_with("b.pdf", 2, "Close it."),
+        ];
+        let steps = || {
+            vec![
+                model_step("One.", &[], &[2, 1]),
+                model_step("Two.", &[], &[1]),
+            ]
+        };
+
+        let (steps_with, sources_with) = checked(steps(), &with_warning);
+        let (steps_without, sources_without) = checked(steps(), &without);
+
+        assert_eq!(sources_with, sources_without);
+        for (with, without) in steps_with.iter().zip(&steps_without) {
+            assert_eq!(with.instruction, without.instruction);
+            assert_eq!(with.sources, without.sources);
         }
     }
 }
